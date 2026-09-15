@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Webmunk</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+    <div class="wrapper">
+        <div class="main-container" id="getStartedContainer">
+            <div class="navbar">
+                <div style="display: flex; justify-content: flex-start; align-items: center;">
+                    <h1 class="title">Get Started</h1>
+                </div>
+            </div>
+
+            <div class="container">
+                <p>Your shopping task usually starts automatically once you finish the initial survey. If it hasn't, enter your Prolific ID below:</p>
+                <input class="logInInput" id="logInInput" type="text" placeholder="Prolific Id">
+
+                <div class="button-container">
+                    <button class="button" id="continueButton">Continue</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-container" id="studyExtensionContainer">
+            <div class="navbar">
+                <div style="display: flex; align-items: center;">
+                    <h1 class="title">Study Browser Extension</h1>
+                </div>
+                <button class="nav-button" id="instructionsButton" type="button">Instructions</button>
+            </div>
+
+            <div class="container">
+                <div id="instructionsPanel" class="instructions-panel" style="display: none;"></div>
+                <div id="loginWarningBanner" class="warning-banner" style="display: none;">You need to sign in to your Amazon account (top of the Amazon page) before you can finish the shopping task. Reaching your cart won't count until you're signed in.</div>
+
+                <div style="display: flex; align-items: center; justify-content: space-between;">
+                    <div>
+                        <p style="font-weight: 500; line-height: 25px; font-size: 16px;">Identifier</p>
+                        <p id="formattedIdentifier" style="font-size: 18px;"></p>
+                    </div>
+                    <button class="button" id="copyButton">Copy</button>
+                </div>
+
+                <div style="display: flex; gap: 10px; flex-direction: column; margin-top: 10px;">
+                    <p id="tasks-status" style="font-weight: 500"></p>
+                    <ul id="task-list" class="list">
+                    </ul>
+                    <a id="shopLink" class="button button--width" href="https://www.amazon.com/gp/cart/view.html" target="_blank" rel="noopener noreferrer" style="display: none;">Go to Cart</a>
+                    <p style="font-size: 14px;">Tasks will be removed after completion (it may take a few hours to refresh)</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="notification" class="notification" style="display: none;">
+            <p id="notification-message" class="notification-message"></p>
+        </div>
+    </div>
+
+<script type="module" src="popup.js"></script>
+
+</body>
+</html>

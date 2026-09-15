@@ -1,0 +1,137 @@
+{
+    "manifest_version": 3,
+	"name": "Webmunk Shopping Study",
+	"version": "1.9",
+    "action": {
+        "default_popup": "popup/popup.html",
+        "default_icon": "images/UvA.png"
+      },
+      "icons": {
+        "16": "images/UvA.png",
+        "32": "images/UvA.png",
+        "48": "images/UvA.png",
+        "128": "images/UvA.png"
+    },
+
+	"description": "Research extension for a University of Amsterdam study on how people search for and choose products while shopping on Amazon.",
+
+    "minimum_chrome_version": "102",
+    "permissions": [
+        "webNavigation",
+        "storage",
+        "tabs",
+        "notifications"
+    ],
+    "host_permissions": [
+        "https://*.jitsu.com/*",
+        "https://firestore.googleapis.com/*",
+        "https://identitytoolkit.googleapis.com/*",
+        "https://securetoken.googleapis.com/*",
+        "https://firebaseinstallations.googleapis.com/*",
+        "https://firebaseremoteconfig.googleapis.com/*",
+        "https://firebaseremoteconfigrealtime.googleapis.com/*",
+        "https://firebasestorage.googleapis.com/*",
+        "https://storage.googleapis.com/*",
+        "https://uva-webmunk.firebasestorage.app/*",
+        "https://europe-west4-uva-webmunk.cloudfunctions.net/*",
+        "https://amazon.com/*",
+        "https://*.amazon.com/*",
+        "https://amazon.co.uk/*",
+        "https://*.amazon.co.uk/*",
+        "https://amazon.de/*",
+        "https://*.amazon.de/*",
+        "https://amazon.nl/*",
+        "https://*.amazon.nl/*",
+        "https://amazon.fr/*",
+        "https://*.amazon.fr/*",
+        "https://amazon.it/*",
+        "https://*.amazon.it/*",
+        "https://amazon.es/*",
+        "https://*.amazon.es/*",
+        "https://amazon.ca/*",
+        "https://*.amazon.ca/*",
+        "https://amazon.com.au/*",
+        "https://*.amazon.com.au/*",
+        "https://amazon.co.jp/*",
+        "https://*.amazon.co.jp/*",
+        "https://amazon.in/*",
+        "https://*.amazon.in/*",
+        "https://amazon.com.mx/*",
+        "https://*.amazon.com.mx/*",
+        "https://amazon.com.br/*",
+        "https://*.amazon.com.br/*"
+    ],
+
+	"background": { "service_worker": "background.js" },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://amazon.com/*",
+                "https://*.amazon.com/*",
+                "https://amazon.co.uk/*",
+                "https://*.amazon.co.uk/*",
+                "https://amazon.de/*",
+                "https://*.amazon.de/*",
+                "https://amazon.nl/*",
+                "https://*.amazon.nl/*",
+                "https://amazon.fr/*",
+                "https://*.amazon.fr/*",
+                "https://amazon.it/*",
+                "https://*.amazon.it/*",
+                "https://amazon.es/*",
+                "https://*.amazon.es/*",
+                "https://amazon.ca/*",
+                "https://*.amazon.ca/*",
+                "https://amazon.com.au/*",
+                "https://*.amazon.com.au/*",
+                "https://amazon.co.jp/*",
+                "https://*.amazon.co.jp/*",
+                "https://amazon.in/*",
+                "https://*.amazon.in/*",
+                "https://amazon.com.mx/*",
+                "https://*.amazon.com.mx/*",
+                "https://amazon.com.br/*",
+                "https://*.amazon.com.br/*"
+            ],
+            "js": ["content.js"],
+            "run_at": "document_start",
+            "all_frames": true
+        }
+    ],
+    "externally_connectable": {
+        "matches": ["https://*.qualtrics.com/*"]
+    },
+    "web_accessible_resources" :[
+        {
+            "resources": ["images/UvA.png"],
+            "matches": [
+                "https://amazon.com/*",
+                "https://*.amazon.com/*",
+                "https://amazon.co.uk/*",
+                "https://*.amazon.co.uk/*",
+                "https://amazon.de/*",
+                "https://*.amazon.de/*",
+                "https://amazon.nl/*",
+                "https://*.amazon.nl/*",
+                "https://amazon.fr/*",
+                "https://*.amazon.fr/*",
+                "https://amazon.it/*",
+                "https://*.amazon.it/*",
+                "https://amazon.es/*",
+                "https://*.amazon.es/*",
+                "https://amazon.ca/*",
+                "https://*.amazon.ca/*",
+                "https://amazon.com.au/*",
+                "https://*.amazon.com.au/*",
+                "https://amazon.co.jp/*",
+                "https://*.amazon.co.jp/*",
+                "https://amazon.in/*",
+                "https://*.amazon.in/*",
+                "https://amazon.com.mx/*",
+                "https://*.amazon.com.mx/*",
+                "https://amazon.com.br/*",
+                "https://*.amazon.com.br/*"
+            ]
+        }
+    ]
+}
