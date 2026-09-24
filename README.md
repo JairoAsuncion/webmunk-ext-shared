@@ -44,11 +44,14 @@ timestamp. URLs are reduced to the path plus search-related parameters.
 | Event | Recorded when |
 |---|---|
 | `registration_completed` | The study assignment is accepted |
-| `amazon_login_confirmed` | Sign-in to Amazon is confirmed (the first one marks task start) |
-| `nav_committed` | A page on the study site is loaded |
+| `repeat_handoff_ignored` | The intake-survey link is opened again with a different assignment; the first one is kept |
+| `amazon_login_block_shown` | The sign-in prompt is shown (before sign-in) |
+| `pre_task_activity_suppressed` | Cart activity before sign-in is not counted |
+| `amazon_login_confirmed` | Sign-in to Amazon is first confirmed (task start) |
+| `nav_committed` | A page on the study site is loaded (prerendered pages are flagged) |
 | `tab_dwell` | Time spent on a page while its tab is active and focused |
 | `search_submitted` | A search query is run |
-| `filter_used` | A search filter or sort order is changed |
+| `filter_used` | A search filter or the sort order is changed (derived from the search URL) |
 | `product_result_click` | A product in the search results is clicked |
 | `product_page_view` | A product detail page is opened |
 | `backtrack_navigation` | Back/forward navigation |
@@ -73,6 +76,13 @@ timestamp. URLs are reduced to the path plus search-related parameters.
 | `src/shared/` | Study policy shared by worker and content script (assignment parsing, URL handling) |
 | `src/utils/`, `src/enums.ts`, `src/types.ts` | Utilities, event names and types |
 | `src/config.js` | Build-time configuration (environment variables) |
+
+## Documentation
+
+- [CHANGELOG.md](CHANGELOG.md): changes per release.
+- [docs/v2.1.0-pilot-fixes.md](docs/v2.1.0-pilot-fixes.md): problems found in the
+  September 2026 pilot, how each was fixed and verified, and how the recorded
+  data changed.
 
 ## Contributing
 

@@ -1,11 +1,12 @@
 import { Backend } from './Backend';
 import { StudyService } from './StudyService';
-import { canTrack, cleanUrl, isShoppingUrl, isCartUrl, hasAssignment, validateQualtricsUrl } from '../shared/StudyPolicy';
+import { canTrack, cleanUrl, isShoppingUrl, isCartUrl, hasAssignment, validateQualtricsUrl, searchState, SORT_LABELS } from '../shared/StudyPolicy';
+import type { SearchState } from '../shared/StudyPolicy';
 
 // Firebase Remote Config's endpoint-override hook expects a window global.
 if (typeof (globalThis as any).window === 'undefined') (globalThis as any).window = globalThis;
 const backend = new Backend();
-const study = new StudyService(backend);
+const study = new StudyService(backend, reason => finishSummary(reason));
 let work: Promise<unknown> = Promise.resolve();
 // Serialize transitions and counters to prevent races across tabs and double-clicks.
 function enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -24,16 +25,23 @@ const BEHAVIOR_EVENTS = new Set([
   'decision_made', 'product_result_click', 'cart_baseline_count', 'cart_snapshot',
   'assistant_hidden', 'assistant_available', 'assistant_leak_detected',
 ]);
+// Diagnostics about the sign-in gate itself: recorded during the shopping task even
+// before Amazon sign-in is confirmed (all other tracking conditions still apply).
+const PRE_LOGIN_EVENTS = new Set(['amazon_login_block_shown', 'pre_task_activity_suppressed']);
 async function record(event: string, props: Record<string, any>, tabId: number, url: string) {
   const s = await chrome.storage.local.get(null);
-  if (!canTrack(s, url)) return;
+  if (!canTrack(PRE_LOGIN_EVENTS.has(event) ? { ...s, amazonLoginConfirmed: true } : s, url)) return;
   const summary = s.studySummary || {};
+  // One baseline per session: several tabs/timers can race to capture it; messages are
+  // serialized here, so the first one wins.
+  if (event === 'cart_baseline_count' && summary.pre_existing_cart_count != null) return;
   const counters: Record<string,string> = { nav_committed:'nav_count', product_page_view:'product_page_view_count',
     add_to_cart_click:'add_to_cart_count', cart_remove:'remove_count', search_submitted:'search_count',
     filter_used:'filter_count', backtrack_navigation:'backtrack_count', decision_made:'decision_count',
     product_result_click:'product_result_click_count', assistant_text:'assistant_interaction_count',
-    assistant_hidden:'assistant_hidden_count', assistant_leak_detected:'assistant_leak_count' };
-  if (counters[event]) summary[counters[event]] = (summary[counters[event]] || 0) + 1;
+    assistant_hidden:'assistant_hidden_count', assistant_leak_detected:'assistant_leak_count',
+    amazon_login_block_shown:'login_block_shown_count', pre_task_activity_suppressed:'pre_task_suppressed_count' };
+  if (counters[event] && props.document_lifecycle !== 'prerender') summary[counters[event]] = (summary[counters[event]] || 0) + 1;
   if (event === 'tab_dwell') summary.dwell_ms = (summary.dwell_ms || 0) + props.dwell_ms;
   if (event === 'assistant_available') summary.assistant_available = true;
   if (event === 'decision_made' && summary.first_decision_latency_ms == null) summary.first_decision_latency_ms = props.decision_latency_ms;
@@ -71,13 +79,15 @@ async function endDwell(now = Date.now()) {
   const start = Math.max(d.since, Number(s.shoppingTaskStartedAt) || now);
   if (now > start) await record('tab_dwell', { dwell_ms: now - start }, d.tabId, d.url);
 }
-async function beginDwell(tabId: number) {
+// committedUrl: the URL from webNavigation.onCommitted, which tab.url may not show yet.
+async function beginDwell(tabId: number, committedUrl?: string) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab?.active || !tab.url) return;
+  const url = committedUrl || tab?.url;
+  if (!tab?.active || !url) return;
   const win = await chrome.windows.get(tab.windowId);
   const s = await chrome.storage.local.get(null);
-  if (!win.focused || !canTrack(s, tab.url)) return;
-  await chrome.storage.session.set({ dwellContext: { tabId, url: cleanUrl(tab.url), since: Date.now(), sessionId: s.studyContext.sessionId } });
+  if (!win.focused || !canTrack(s, url)) return;
+  await chrome.storage.session.set({ dwellContext: { tabId, url: cleanUrl(url), since: Date.now(), sessionId: s.studyContext.sessionId } });
 }
 async function finishSummary(reason: string) {
   const s = await chrome.storage.local.get(null);
@@ -94,12 +104,21 @@ async function finishSummary(reason: string) {
 chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
   if (!change.url && change.status !== 'loading' && change.status !== 'complete') return;
   void enqueue(async () => {
-    if (change.status === 'loading' || change.url) {
+    // A new URL in the tab ends the current page's dwell and starts the next one. The
+    // navigation-commit handler below does the same and skips a page already being timed,
+    // so the two notifications Chrome sends for one navigation produce one dwell row.
+    if (change.url) {
       const { dwellContext } = await chrome.storage.session.get('dwellContext');
-      if (dwellContext?.tabId === tabId) await endDwell();
+      if (dwellContext?.tabId === tabId && dwellContext.url !== cleanUrl(change.url)) {
+        await endDwell();
+        await beginDwell(tabId, change.url);
+      }
     }
     if (tab.url && isShoppingUrl(tab.url) && hasAssignment(tab.url)) await study.enroll(tab.url, tabId);
-    if (change.status === 'complete') await beginDwell(tabId);
+    if (change.status === 'complete') {
+      const { dwellContext } = await chrome.storage.session.get('dwellContext');
+      if (dwellContext?.tabId !== tabId) await beginDwell(tabId);
+    }
   }).catch(console.error);
 });
 chrome.tabs.onActivated.addListener(({tabId}) => {
@@ -113,16 +132,69 @@ chrome.windows.onFocusChanged.addListener(windowId => {
     if (tab?.id != null) await beginDwell(tab.id);
   }).catch(console.error);
 });
+async function forgetLoginReport(tabId: number) {
+  const { loginReports = {} } = await chrome.storage.session.get('loginReports');
+  if (!(tabId in loginReports)) return;
+  delete loginReports[tabId];
+  await chrome.storage.session.set({ loginReports });
+}
 chrome.tabs.onRemoved.addListener(tabId => {
   void enqueue(async () => {
     const { dwellContext } = await chrome.storage.session.get('dwellContext');
     if (dwellContext?.tabId === tabId) await endDwell();
+    await forgetLoginReport(tabId);
     // Closing a tab is not completion; the study can be resumed.
   }).catch(console.error);
 });
+// Filter and sort actions are derived from consecutive search-results URLs in a tab: the
+// URL records exactly what Amazon applied, which click listeners could not (the sort menu
+// fires no change event; list expanders looked like filters). Amazon applies most filters
+// in place (history.pushState, no page load), so this also runs on onHistoryStateUpdated.
+// Back/forward navigation and a new query are not filter actions. The clicked filter's
+// label arrives as a hint.
+async function recordSearchChange(tabId: number, url: string, qualifiers: string[]) {
+  const next = searchState(url);
+  if (!next) return;
+  const { searchStates = {}, filterHints = {} } = await chrome.storage.session.get(['searchStates', 'filterHints']);
+  const prev: SearchState | undefined = searchStates[tabId];
+  searchStates[tabId] = next;
+  const hint = filterHints[tabId];
+  delete filterHints[tabId];
+  await chrome.storage.session.set({ searchStates, filterHints });
+  if (!prev || prev.query !== next.query || qualifiers.includes('forward_back')) return;
+  if (prev.sort !== next.sort) {
+    await record('filter_used', { filter_type: 'sort', filter_value: next.sort || 'default',
+      filter_text: SORT_LABELS[next.sort] || next.sort, source: 'url' }, tabId, url);
+  }
+  const added = next.refinements.filter(r => !prev.refinements.includes(r));
+  const removed = prev.refinements.filter(r => !next.refinements.includes(r));
+  if (added.length || removed.length) {
+    const text = hint && Date.now() - hint.at < 15000 ? hint.text : undefined;
+    await record('filter_used', { filter_type: 'refinement', added, removed,
+      ...(text ? { filter_text: text } : {}), source: 'url' }, tabId, url);
+  }
+}
+
 chrome.webNavigation.onCommitted.addListener(details => {
   if (details.frameId !== 0 || !isShoppingUrl(details.url)) return;
-  void enqueue(() => record('nav_committed', {}, details.tabId, details.url)).catch(console.error);
+  // Prerendered pages (speculative loads) are flagged and not counted: they may never be seen.
+  const prerender = (details as any).documentLifecycle === 'prerender';
+  void enqueue(async () => {
+    await record('nav_committed', prerender ? { document_lifecycle: 'prerender' } : {}, details.tabId, details.url);
+    if (prerender) return;
+    await recordSearchChange(details.tabId, details.url, (details as any).transitionQualifiers || []);
+    // Time the page from commit, not from the full page load: quick visits were lost.
+    const { dwellContext } = await chrome.storage.session.get('dwellContext');
+    if (dwellContext?.tabId === details.tabId && dwellContext.url === cleanUrl(details.url)) return;
+    if (dwellContext?.tabId === details.tabId) await endDwell();
+    await beginDwell(details.tabId, details.url);
+  }).catch(console.error);
+});
+
+chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
+  if (details.frameId !== 0 || !isShoppingUrl(details.url)) return;
+  void enqueue(() => recordSearchChange(details.tabId, details.url, (details as any).transitionQualifiers || []))
+    .catch(console.error);
 });
 
 async function activeStudyTab(): Promise<chrome.tabs.Tab> {
@@ -147,7 +219,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
   const content = tabId != null && isShoppingUrl(sender.url);
   const top = content && sender.frameId === 0;
-  const types = new Set(['study_context','amazon_login_status','telemetry','study_retry','study_cart',
+  const types = new Set(['study_context','amazon_login_status','telemetry','filter_hint','study_retry','study_cart',
     'study_refresh_cart','study_confirm','study_continue','study_stop','study_preview_reset','study_preview_p2','study_expired']);
   if (!types.has(message.type)) return;
   void enqueue(async () => {
@@ -168,17 +240,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'amazon_login_status' && top) {
       const s = await chrome.storage.local.get('studyContext');
       if (s.studyContext?.origin !== new URL(sender.url!).origin) return {ok:false};
-      if (!message.loggedIn) await endDwell();
-      await study.login(message.loggedIn === true);
-      if (message.loggedIn) {
+      // Each tab reports what its own page shows. A tab rendered before sign-in keeps showing
+      // "signed out"; letting it override a signed-in tab made the tabs flip the state back and
+      // forth on every storage change (1,409 login events in one pilot session). Signed in =
+      // any study tab currently reports signed in.
+      const { loginReports = {} } = await chrome.storage.session.get('loginReports');
+      loginReports[tabId!] = message.loggedIn === true;
+      await chrome.storage.session.set({ loginReports });
+      const loggedIn = Object.values(loginReports).some(Boolean);
+      if (!loggedIn) await endDwell();
+      await study.login(loggedIn);
+      if (loggedIn) {
         const { dwellContext } = await chrome.storage.session.get('dwellContext');
         if (!dwellContext) await beginDwell(tabId!);
       }
       return {ok:true};
     }
-    if (message.type === 'telemetry' && content && BEHAVIOR_EVENTS.has(message.event)) {
+    if (message.type === 'telemetry' && content && (BEHAVIOR_EVENTS.has(message.event) || PRE_LOGIN_EVENTS.has(message.event))) {
       if (!top && !['assistant_hidden','assistant_leak_detected'].includes(message.event)) return {ok:false};
       await record(message.event, message.properties || {}, tabId!, sender.url!);
+      return {ok:true};
+    }
+    if (message.type === 'filter_hint' && top) {
+      if (!canTrack(await chrome.storage.local.get(null), sender.url!)) return {ok:false};
+      const { filterHints = {} } = await chrome.storage.session.get('filterHints');
+      filterHints[tabId!] = { text: String(message.text || '').slice(0, 200), at: Date.now() };
+      await chrome.storage.session.set({ filterHints });
       return {ok:true};
     }
     if (!fromPanel) throw new Error('This action is only available in the study panel.');

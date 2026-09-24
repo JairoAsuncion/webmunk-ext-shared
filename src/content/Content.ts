@@ -1,7 +1,7 @@
 import { NotificationService } from './NotificationService';
 import { Event } from '../enums';
 import { debug } from '../utils/log';
-import { isShoppingUrl, isCartUrl, parseAssignment } from '../shared/StudyPolicy';
+import { isShoppingUrl, isCartUrl, parseAssignment, productAsin } from '../shared/StudyPolicy';
 import { AssistantControl, ASSISTANT_SELECTORS, isVisible } from './AssistantControl';
 
 declare const chrome: any;
@@ -25,7 +25,11 @@ export class Content {
   private hasStudyContext = false;
   private assistantObserver: MutationObserver | null = null;
   private banner: HTMLElement | null = null;
+  private bannerLabel: HTMLElement | null = null;
+  private bannerNoticeShown = '';
+  private studyNotice = '';
   private pageCaptured = false;
+  private pageViewCaptured = false;
   private lastAssistantCapture = 0;
   private readonly RUFUS_CAPTURE_THROTTLE_MS = 1500;
   private lastAssistantPayloadHash: string | null = null;
@@ -38,8 +42,6 @@ export class Content {
   // selectors but was still visible right after we tried to hide it - see checkAssistantLeak().
   private lastAssistantLeakTs: number = 0;
   private readonly ASSISTANT_LEAK_THROTTLE_MS = 10000;
-  private lastFilterSent = 0;
-  private readonly FILTER_THROTTLE_MS = 1200;
   private lastCartSnapshotTs = 0;
   private lastCartSnapshotHash = '';
   private readonly CART_SNAPSHOT_THROTTLE_MS = 3000;
@@ -144,7 +146,6 @@ export class Content {
     if (!this.isTopFrame) return;
     this.addClickListener();
     this.addFilterListener();
-    this.addSortListener();
     this.addResultClickListener();
     this.addCartRemoveListener();
     this.addBfcacheRestoreListener();
@@ -161,13 +162,14 @@ export class Content {
 
   private initStudyState(): void {
     const refresh = () => chrome.storage.local.get(
-      ['taskStage','amazonLoginConfirmed','studyContext','studyError'], (s:any) => {
+      ['taskStage','amazonLoginConfirmed','studyContext','studyError','studyNotice'], (s:any) => {
         this.taskStage = s.taskStage || 'initial';
         this.amazonLoginConfirmed = s.amazonLoginConfirmed === true;
         this.hasStudyContext = !!s.studyContext;
         this.contextOrigin = s.studyContext?.origin || null;
         this.contextExpiresAt = Number(s.studyContext?.expiresAt) || 0;
         this.arm = s.studyContext?.arm || null;
+        this.studyNotice = s.studyNotice || '';
         const assignedPage = this.contextOrigin === location.origin;
         const pendingClassic = !s.studyContext && parseAssignment(location.href)?.arm === 'classic';
         this.assistantControl.setEnabled(pendingClassic || (assignedPage &&
@@ -186,7 +188,7 @@ export class Content {
     refresh();
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', refresh, {once:true});
     chrome.storage.onChanged.addListener((changes:any, area:string) => {
-      if (area === 'local' && ['taskStage','amazonLoginConfirmed','studyContext','studyError'].some(k => k in changes)) refresh();
+      if (area === 'local' && ['taskStage','amazonLoginConfirmed','studyContext','studyError','studyNotice'].some(k => k in changes)) refresh();
     });
     if (this.isTopFrame) {
       this.loginGuardTimer = setInterval(() => {
@@ -244,13 +246,27 @@ export class Content {
         });
       });
       box.append(label,button); document.body.prepend(box); this.banner = box;
+      this.bannerLabel = label; this.bannerNoticeShown = '';
+    }
+    // A repeated survey link leaves the task unchanged; say so where the participant lands.
+    if (this.bannerLabel && this.studyNotice !== this.bannerNoticeShown) {
+      this.bannerLabel.textContent = this.studyNotice || 'Shopping study: instructions and final product confirmation';
+      this.bannerNoticeShown = this.studyNotice;
     }
   }
   private capturePageOnce(): void {
-    if (this.pageCaptured || document.readyState === 'loading' || !this.trackingActive()) return;
+    // A prerendered page is not seen until it is activated (prerenderingchange).
+    if (!this.trackingActive() || (document as any).prerendering) return;
+    // The view needs only the URL, so send it as soon as study state is loaded. Waiting for
+    // DOMContentLoaded lost quick visits: product pages keep parsing for several seconds.
+    if (!this.pageViewCaptured) {
+      this.pageViewCaptured = true;
+      const asin = productAsin(location.href);
+      if (asin) this.sendTelemetry(Event.PRODUCT_PAGE_VIEW, {asin});
+    }
+    if (this.pageCaptured || document.readyState === 'loading') return;
     this.pageCaptured = true;
     this.captureNavigationType(location.href);
-    if (this.isProductDetailPage(location.href)) this.sendTelemetry(Event.PRODUCT_PAGE_VIEW, {asin:this.getAsinFromUrl(location.href)});
     this.captureCartSnapshot();
   }
 
@@ -383,7 +399,7 @@ export class Content {
         this.loginBlockActive = true;
         // One row per block episode (not per interval tick), so how often and how long this
         // control is actually needed stays queryable against amazon_login_confirmed's stamp.
-        this.sendTelemetry(Event.AMAZON_LOGIN_BLOCK_SHOWN, { url: window.location.href });
+        this.sendPreLoginTelemetry(Event.AMAZON_LOGIN_BLOCK_SHOWN, { url: window.location.href });
       }
       return;
     }
@@ -414,6 +430,7 @@ export class Content {
   }
 
   private addContentLoadedListener(): void {
+    document.addEventListener('prerenderingchange', () => this.capturePageOnce(), {once:true});
     document.addEventListener('DOMContentLoaded', () => {
       this.checkAmazonLoginStatus();
       this.reassertLoginGate();
@@ -534,19 +551,18 @@ export class Content {
     });
   }
 
+  // filter_used events come from the worker, which compares consecutive search URLs (see
+  // recordSearchChange in Worker.ts). This listener only supplies the clicked filter's label.
   private addFilterListener(): void {
     document.addEventListener('click', (e: MouseEvent) => {
       const target = e.target as HTMLElement | null;
-      if (!target) return;
-
-      const now = Date.now();
-      if (now - this.lastFilterSent < this.FILTER_THROTTLE_MS) return;
+      if (!target || !this.trackingActive()) return;
 
       const filterElement = target.closest(
         '#s-refinements a, #s-refinements input[type="checkbox"], #s-refinements li, #s-refinements span',
       ) as HTMLElement | null;
-
-      if (!filterElement) return;
+      // "See more"/"See less" expand a filter list; they are not filters.
+      if (!filterElement || filterElement.closest('.a-expander-prompt, .a-expander-header, [data-action="s-expander"]')) return;
 
       const rawText =
         filterElement.innerText ||
@@ -554,23 +570,13 @@ export class Content {
         filterElement.getAttribute('data-a-size') ||
         '';
       const filterText = rawText.replace(/\s+/g, ' ').trim();
-      if (!filterText) return;
+      if (!filterText || /^see (more|less|all)\b/i.test(filterText)) return;
 
-      this.lastFilterSent = now;
-      this.sendTelemetry(Event.FILTER_USED, {
-        url: window.location.href,
-        filter_type: 'refinement',
-        filter_text: filterText,
-      });
-    });
-  }
-
-  private addSortListener(): void {
-    document.addEventListener('change', (event) => {
-      const select = event.target as HTMLSelectElement;
-      if (!select.matches?.('select#s-result-sort-select')) return;
-      this.sendTelemetry(Event.FILTER_USED, {filter_type:'sort',
-        filter_text:select.options[select.selectedIndex]?.text?.trim(), filter_value:select.value});
+      try {
+        chrome.runtime.sendMessage({ type: 'filter_hint', text: filterText }, () => { void chrome.runtime.lastError; });
+      } catch {
+        // Extension reloaded while this tab's script is still the old instance.
+      }
     });
   }
 
@@ -636,7 +642,7 @@ export class Content {
         // Evidence this exact guard fired - proof the earlier data-loss bug (this flag getting
         // silently burned on an event EventService would have dropped anyway) can't recur,
         // since a decision attempt in this state is now visible instead of just vanishing.
-        this.sendTelemetry(Event.PRE_TASK_ACTIVITY_SUPPRESSED, {
+        this.sendPreLoginTelemetry(Event.PRE_TASK_ACTIVITY_SUPPRESSED, {
           suppressed_event: Event.DECISION_MADE,
           reason: !taskStarted ? 'not_registered' : 'not_logged_in',
           url,
@@ -753,7 +759,7 @@ export class Content {
         // per suppressed episode (not once per page load) so it stays meaningful rather than
         // just counting how many pages were viewed while blocked.
         if (!result.cartBaselineSuppressionLogged) {
-          this.sendTelemetry(Event.PRE_TASK_ACTIVITY_SUPPRESSED, {
+          this.sendPreLoginTelemetry(Event.PRE_TASK_ACTIVITY_SUPPRESSED, {
             suppressed_event: Event.CART_BASELINE_COUNT,
             reason: !taskStarted ? 'not_registered' : 'not_logged_in',
           });
@@ -1112,8 +1118,18 @@ export class Content {
     this.sendTelemetry(Event.ASSISTANT_TEXT, payload);
   }
 
+  // Sign-in gate diagnostics: sent during the shopping task before sign-in is confirmed.
+  private sendPreLoginTelemetry(event: Event, properties: Record<string, any> = {}): void {
+    if (this.taskStage !== 'shopping' || this.contextOrigin !== location.origin || !isShoppingUrl(location.href)) return;
+    this.postTelemetry(event, properties);
+  }
+
   private sendTelemetry(event: Event, properties: Record<string, any> = {}): void {
     if (!this.trackingActive()) return;
+    this.postTelemetry(event, properties);
+  }
+
+  private postTelemetry(event: Event, properties: Record<string, any>): void {
     try {
       chrome.runtime.sendMessage(
         {
@@ -1134,16 +1150,10 @@ export class Content {
   }
 
   private getAsinFromUrl(url: string): string | null {
-    const dpMatch = url.match(/\/dp\/([A-Z0-9]{10})/i);
-    if (dpMatch && dpMatch[1]) return dpMatch[1];
-
-    const gpMatch = url.match(/\/gp\/product\/([A-Z0-9]{10})/i);
-    if (gpMatch && gpMatch[1]) return gpMatch[1];
-
-    return null;
+    return productAsin(url);
   }
 
   private isProductDetailPage(url: string): boolean {
-    return /\/dp\/[A-Z0-9]{10}/i.test(url) || /\/gp\/product\/([A-Z0-9]{10})/i.test(url);
+    return productAsin(url) !== null;
   }
 }

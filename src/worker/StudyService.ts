@@ -4,11 +4,12 @@ import type { StudyContext, CartItem } from '../shared/StudyPolicy';
 import { FINAL_SURVEY_URL } from '../shared/StudyConfig';
 
 export class StudyService {
-  constructor(private backend: Backend) {}
+  // onStopped lets the worker close the session (session_summary) when enrolment stops it.
+  constructor(private backend: Backend, private onStopped: (reason: string) => Promise<void> = async () => {}) {}
 
   async enroll(url: string, tabId: number): Promise<void> {
     if (!isShoppingUrl(url) || !hasAssignment(url)) return;
-    const assignment = parseAssignment(url);
+    let assignment = parseAssignment(url);
     const s = await chrome.storage.local.get(null);
     if (!assignment) {
       // Invalid handoffs never become a default chat condition or reuse an old assignment.
@@ -24,15 +25,30 @@ export class StudyService {
         studyError:'This installation has a registration from an older study session. Contact the researcher before continuing.' });
       return;
     }
-    if (old && (old.prolificId !== assignment.prolificId || old.arm !== assignment.arm ||
-        old.category.toLowerCase() !== assignment.category.toLowerCase() || old.origin !== assignment.origin)) {
-      await chrome.storage.local.set({ taskStage: 'stopped', amazonLoginConfirmed: false,
-        studyError: 'This browser already has a different study session. Do not continue; contact the researcher.' });
+    if (old && old.prolificId !== assignment.prolificId) {
+      await this.stop(s, 'different_participant',
+        'This browser already has a different study session. Do not continue; contact the researcher.');
       return;
     }
+    if (old && (old.arm !== assignment.arm || old.origin !== assignment.origin ||
+        old.category.toLowerCase() !== assignment.category.toLowerCase())) {
+      // Re-taking the intake survey re-randomizes the assignment. The first assignment
+      // stays authoritative; the offered one is logged (once per distinct offer - one link
+      // reaches enrolment several times while its page loads) so affected sessions can be flagged.
+      const offer = [assignment.arm, assignment.category, assignment.origin].join('|');
+      const ignored: string[] = s.ignoredHandoffs || [];
+      if (!ignored.includes(offer)) {
+        await chrome.storage.local.set({ ignoredHandoffs: [...ignored, offer] });
+        await this.backend.track('repeat_handoff_ignored', { offered_arm: assignment.arm,
+          offered_category: assignment.category, offered_budget: assignment.budget, offered_origin: assignment.origin });
+      }
+      await chrome.storage.local.set({ studyNotice: 'You are already taking part in this study, so the new survey ' +
+        `link was ignored. Your task has not changed: ${old.category}, budget $${old.budget}. Please continue with it.` });
+      assignment = { prolificId: old.prolificId, arm: old.arm, category: old.category, budget: old.budget, origin: old.origin };
+    }
     if (s.user?.prolificId && s.user.prolificId !== assignment.prolificId) {
-      await chrome.storage.local.set({ taskStage: 'stopped', amazonLoginConfirmed: false,
-        studyError: 'The participant ID does not match this browser’s registration. Contact the researcher.' });
+      await this.stop(s, 'different_participant',
+        'The participant ID does not match this browser’s registration. Contact the researcher.');
       return;
     }
     if (old && ['shopping','final','done','stopped'].includes(s.taskStage)) return;
@@ -64,12 +80,20 @@ export class StudyService {
     }
   }
 
+  private async stop(s: Record<string, any>, reason: string, studyError: string): Promise<void> {
+    const wasShopping = s.taskStage === 'shopping';
+    await chrome.storage.local.set({ taskStage: 'stopped', amazonLoginConfirmed: false, studyError,
+      ...(wasShopping ? { shoppingTaskStoppedAt: Date.now() } : {}) });
+    await this.onStopped(reason);
+  }
+
   async login(loggedIn: boolean): Promise<void> {
     const s = await chrome.storage.local.get(['taskStage','amazonLoginConfirmed','shoppingTaskStartedAt']);
     if (s.taskStage !== 'shopping' || s.amazonLoginConfirmed === loggedIn) return;
     await chrome.storage.local.set({ amazonLoginConfirmed: loggedIn,
       ...(loggedIn ? { shoppingTaskStartedAt: s.shoppingTaskStartedAt || Date.now() } : {}) });
-    if (loggedIn) await this.backend.track('amazon_login_confirmed', {});
+    // Only the first confirmation marks the task start; later re-confirmations are not events.
+    if (loggedIn && !s.shoppingTaskStartedAt) await this.backend.track('amazon_login_confirmed', {});
   }
 
   async confirm(asin: string, tabId: number): Promise<void> {

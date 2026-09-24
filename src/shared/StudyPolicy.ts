@@ -27,6 +27,31 @@ export function isShoppingUrl(raw: unknown): boolean {
 export function isCartUrl(raw: unknown): boolean {
   return isShoppingUrl(raw) && /\/(?:gp\/)?cart(?:\/|$)/i.test(new URL(String(raw)).pathname);
 }
+// ASIN of a product detail page URL (absolute or relative): /dp/, /gp/product/ or /gp/aw/d/.
+export function productAsin(raw: unknown): string | null {
+  const m = String(raw ?? '').split(/[?#]/)[0].match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})(?:\/|$)/i);
+  return m ? m[1].toUpperCase() : null;
+}
+// Search-results state that filter and sort actions change. Refinements are Amazon's
+// rh tokens (department filters appear there as n:...) plus custom price bounds, sorted
+// for comparison. The search box's department scope (i=, e.g. i=aps) belongs to the
+// search itself, and Amazon drops it from the URL right after loading the results.
+export type SearchState = { query: string; refinements: string[]; sort: string };
+export function searchState(raw: unknown): SearchState | null {
+  let u: URL;
+  try { u = new URL(String(raw)); } catch { return null; }
+  if (!isShoppingUrl(u.href) || !/^\/s(?:\/|$)/.test(u.pathname)) return null;
+  const p = u.searchParams;
+  const query = (p.get('k') || p.get('field-keywords') || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const rh = (p.get('rh') || '').split(',').map(t => t.trim()).filter(Boolean);
+  const extra = ['low-price', 'high-price'].filter(k => p.get(k)).map(k => `${k}:${p.get(k)}`);
+  return { query, refinements: [...new Set([...rh, ...extra])].sort(), sort: p.get('s') || '' };
+}
+export const SORT_LABELS: Record<string, string> = {
+  '': 'Featured', 'relevanceblender': 'Featured', 'price-asc-rank': 'Price: Low to High',
+  'price-desc-rank': 'Price: High to Low', 'review-rank': 'Avg. Customer Review',
+  'date-desc-rank': 'Newest Arrivals', 'exact-aware-popularity-rank': 'Best Sellers',
+};
 export function parseArm(raw: unknown): Arm | null {
   return raw === 'classic' || raw === 'chat_no_guide' || raw === 'chat' ? raw : null;
 }

@@ -26,7 +26,7 @@ export class EventService {
     if (!c?.sessionId || user?.prolificId !== c.prolificId || user?.active === false) return;
     const eventId = event === 'final_choice_confirmed' || event === 'session_summary' ? c.sessionId + ':' + event : crypto.randomUUID();
     const payload: Record<string, any> = { ...properties, event, event_type:event, event_id:eventId,
-      study_id:STUDY_ID, schema_version:'3', ts:Date.now(), user_id:c.prolificId,
+      study_id:STUDY_ID, schema_version:'4', ts:Date.now(), user_id:c.prolificId,
       session_id:c.sessionId, arm:c.arm, product_category:c.category, budget:c.budget };
     if (JSON.stringify(payload).length > 64000) {
       payload.turns = Array.isArray(payload.turns) ? payload.turns.slice(-3) : undefined;

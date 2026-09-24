@@ -48,6 +48,8 @@ async function render() {
     stage === 'stopped' || stage === 'done' ? 'Shopping task stopped' : 'Waiting for the study’s Amazon link';
   el('error').textContent = state.studyError || actionError;
   show('error',!!(state.studyError || actionError));
+  el('studyNotice').textContent = state.studyNotice || '';
+  show('studyNotice', stage === 'shopping' && !!state.studyNotice);
   if (state.dataUploadError) el('upload').textContent = state.dataUploadError;
   show('upload',!!state.dataUploadError);
   if (c) {
