@@ -1,153 +1,32 @@
-* {
-    margin: 0;
-    font-family: Roboto, sans-serif;
+:root {
+  --uva-maroon: #a41b33;
+  --uva-maroon-dark: #7f1527;
 }
-
-.wrapper {
-    width: 450px;
-    min-height: 320px;
-
-    border: 1px solid black;
+html { color-scheme: light; }
+body { margin: 0; color: #222; background: #fff; font-family: Roboto, system-ui, sans-serif; line-height: 1.5; }
+main { padding: 0 0 1rem; max-width: 36rem; margin: auto; }
+header {
+  display: flex; align-items: center; gap: .75rem;
+  padding: .85rem 1rem; margin-bottom: 1rem;
+  background: var(--uva-maroon); color: #fff;
 }
-
-.navbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    width: 100%;
-    height: 60px;
-
-    background-color: #a41b33;
-}
-
-.title {
-    margin-left: 10px;
-
-    font-size: 22px;
-    color: white;
-    font-weight: 500;
-}
-
-.container {
-    margin: 20px 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 15px;
-
-    font-size: 16px;
-}
-
-.logInInput {
-    padding: 15px;
-    margin-bottom: 10px;
-
-    color: gray;
-    font-size: 16px;
-    border: 1px solid gray;
-    outline: none;
-    border-radius: 4px;
-}
-
-.notification {
-    position: absolute;
-
-    padding: 10px 0;
-    width: 100%;
-
-    text-align: center;
-    animation: notify 1s linear forwards;
-}
-
-@keyframes notify {
-    from {
-        bottom: -100px;
-    }
-    to {
-        bottom: 0;
-    }
-}
-
-.notification-message {
-    margin: 0 10px;
-
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    color: white;
-    font-size: 14px;
-}
-
-.list {
-    line-height: 30px;
-    font-size: 18px;
-    cursor: pointer;
-}
-
-.button {
-    padding: 10px;
-    display: flex;
-    justify-content: space-around;
-    gap: 5px;
-    align-items: center;
-    width: 110px;
-
-    background-color: #a41b33;
-    color: white;
-    border: none;
-    text-transform: uppercase;
-    border-radius: 4px;
-
-    &:hover {
-        background-color: brown;
-        cursor: pointer;
-    }
-}
-
-.button--width {
-    width: 220px;
-}
-
-.button-container {
-    display: flex;
-    justify-content: flex-end;
-}
-
-.nav-button {
-    margin-right: 10px;
-    padding: 6px 10px;
-
-    background-color: transparent;
-    color: white;
-    border: 1px solid white;
-    border-radius: 4px;
-    font-size: 13px;
-    text-transform: uppercase;
-
-    &:hover {
-        background-color: rgba(255, 255, 255, 0.15);
-        cursor: pointer;
-    }
-}
-
-.instructions-panel {
-    padding: 12px;
-
-    background-color: #f4f4f4;
-    border: 1px solid #ddd;
-    border-radius: 4px;
-    color: #333;
-    font-size: 14px;
-    line-height: 1.5;
-    white-space: pre-line;
-}
-
-.warning-banner {
-    padding: 10px 12px;
-
-    background-color: #fff3cd;
-    border: 1px solid #ffe69c;
-    border-radius: 4px;
-    color: #664d03;
-    font-size: 14px;
-    line-height: 1.4;
-}
+header h1 { color: #fff; }
+main > :not(header) { margin-left: 1rem; margin-right: 1rem; }
+h1, h2 { font: inherit; font-weight: 700; }
+button, input { font: inherit; }
+button { cursor: pointer; display: block; width: 100%; padding: .7em 1em; margin: .7rem 0; background: var(--uva-maroon); color: white; border: 1px solid var(--uva-maroon); border-radius: .35rem; }
+button:hover:not(:disabled) { background: var(--uva-maroon-dark); border-color: var(--uva-maroon-dark); }
+button.secondary { color: #333; background: white; border-color: #888; }
+button.secondary:hover:not(:disabled) { background: #f4f4f4; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button:focus-visible, input:focus-visible { outline: 3px solid #1766ad; outline-offset: 2px; }
+.notice { background: #fff6da; border-left: .25rem solid #a36b00; padding: .75rem; }
+.error { color: #8d142a; border: 1px solid; padding: .75rem; overflow-wrap: anywhere; }
+fieldset { border: 1px solid #ccc; margin: 1rem 0; padding: .75rem; }
+.product { display: flex; align-items: flex-start; gap: .5rem; padding: .6rem 0; border-bottom: 1px solid #eee; overflow-wrap: anywhere; }
+.product input { flex-shrink: 0; margin-top: .35em; }
+.confirmation { display: block; }
+#pid { overflow-wrap: anywhere; color: #555; }
+#p2Url { box-sizing: border-box; width: 100%; padding: .5em; }
+#completedOnly { padding: 1rem; margin: 0; }
+[hidden] { display: none !important; }

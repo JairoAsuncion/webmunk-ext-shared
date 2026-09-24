@@ -1,21 +1,3 @@
-export enum NotificationText {
-  FILL_OUT = "It`s time to complete a survey. Please click on your extension to continue.",
-  REMOVE = 'Please uninstall <a class="open-extensions-link" href="#">the Webmunk Study extension</a>!',
-  AMAZON_LOGIN = "Please sign in to your Amazon account (top of the page) to begin the shopping task.",
-  AMAZON_LOGIN_REQUIRED_AT_CART = "You're not signed in yet, so this doesn't count as finishing the shopping task. Please sign in to your Amazon account (top of the page), then return to your cart to continue.",
-}
-
-export enum UrlParameters {
-  ONLY_INFORMATION = "oi",
-  AD_BLOCKER = "ab",
-  FACEBOOK = "fad",
-  GOOGLE_AND_YOUTUBE = "gyta",
-  AMAZON = "aap",
-  ARM = "arm",
-  PROLIFIC_ID = "PROLIFIC_PID",
-  PRODUCT_CATEGORY = "category",
-}
-
 export enum Event {
   // legacy events kept so existing services still compile
   URL_TRACKING = "url_tracking",

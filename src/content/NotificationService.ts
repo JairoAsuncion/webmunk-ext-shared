@@ -12,9 +12,9 @@ export class NotificationService {
   // button href is refreshed on every mount instead of frozen at build time.
   private loginBlockSignInUrl = '';
 
-  constructor() {
-    chrome.runtime.onMessage.addListener(this.handleMessage.bind(this));
-  }
+  // Only the local login block is used by the shopping study. Do not register
+  // the legacy all-message listener: it can steal replies from live-cart reads.
+  constructor() {}
 
   private async handleMessage(message: any, sender: chrome.runtime.MessageSender, sendResponse: (response?: any) => void): Promise<void> {
     if (message.action === 'webmunkExt.notificationService.extensionNotificationRequest') {
@@ -137,7 +137,7 @@ export class NotificationService {
           You must be signed in to your Amazon account (on this Amazon site) to do the
           shopping task. Sign in and this page unlocks on its own.
         </p>
-        <a class="webmunk-block-signin-button" href="${signInUrl}">Sign in to Amazon</a>
+        <a class="webmunk-block-signin-button">Sign in to Amazon</a>
         <button type="button" class="webmunk-block-recheck">Already signed in? Reload this page</button>
       </div>
     `;

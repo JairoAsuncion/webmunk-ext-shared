@@ -1,7 +1,8 @@
 {
   "name": "webmunk-ext-shared",
+  "version": "2.0.0",
   "private": true,
-  "description": "Read-only export of the Webmunk Shopping Study Chrome extension source - the files bundled into the Chrome Web Store package. Synced automatically; see README.md.",
+  "description": "Source of the Webmunk Shopping Study Chrome extension. See README.md.",
   "dependencies": {
     "firebase": "^12.15.0",
     "@jitsu/js": "^1.10.4"

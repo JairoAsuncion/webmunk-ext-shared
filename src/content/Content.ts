@@ -1,18 +1,16 @@
 import { NotificationService } from './NotificationService';
 import { Event } from '../enums';
 import { debug } from '../utils/log';
+import { isShoppingUrl, isCartUrl, parseAssignment } from '../shared/StudyPolicy';
+import { AssistantControl, ASSISTANT_SELECTORS, isVisible } from './AssistantControl';
 
 declare const chrome: any;
 
-// `chat_no_guide` is treated exactly like `chat` here (assistant left visible,
-// assistant text captured) - every assistant check below is `classic` vs
-// not-`classic`. The label only matters for downstream analysis. Keep in sync
-// with `Arm` in src/worker/ArmService.ts.
+// `chat_no_guide` and `chat` both leave the assistant available. Only the panel's
+// guidance differs. Unknown assignments never enable assistant capture.
 type Arm = 'chat' | 'classic' | 'chat_no_guide';
 
 export class Content {
-  private lastScrollSent = 0;
-  private readonly SCROLL_THROTTLE_MS = 1000;
   private readonly notificationService: NotificationService;
   // The manifest now injects this script into every same-origin Amazon iframe too (all_frames),
   // so a classic-arm assistant panel rendered inside an iframe - rather than the top document -
@@ -21,6 +19,13 @@ export class Content {
   // top-frame-only below - none of that should run once per iframe.
   private readonly isTopFrame: boolean = window === window.top;
   private arm: Arm | null = null;
+  private readonly assistantControl = new AssistantControl();
+  private contextOrigin: string | null = null;
+  private contextExpiresAt = 0;
+  private hasStudyContext = false;
+  private assistantObserver: MutationObserver | null = null;
+  private banner: HTMLElement | null = null;
+  private pageCaptured = false;
   private lastAssistantCapture = 0;
   private readonly RUFUS_CAPTURE_THROTTLE_MS = 1500;
   private lastAssistantPayloadHash: string | null = null;
@@ -29,20 +34,14 @@ export class Content {
   private assistantAvailableSent = false;
   private lastSearchSent = 0;
   private readonly SEARCH_THROTTLE_MS = 2000;
-  private lastAssistantHiddenUrl: string | null = null;
-  private lastAssistantHiddenCount: number = 0;
-  private lastAssistantHiddenTs: number = 0;
-  private readonly ASSISTANT_HIDDEN_THROTTLE_MS = 10000;
   // Diagnostic signal for the classic arm: an assistant entry point/panel matched our
   // selectors but was still visible right after we tried to hide it - see checkAssistantLeak().
   private lastAssistantLeakTs: number = 0;
   private readonly ASSISTANT_LEAK_THROTTLE_MS = 10000;
-  private lastSubtotalValue: string | null = null;
-  private lastSubtotalTs: number = 0;
-  private readonly SUBTOTAL_THROTTLE_MS = 5000;
   private lastFilterSent = 0;
   private readonly FILTER_THROTTLE_MS = 1200;
   private lastCartSnapshotTs = 0;
+  private lastCartSnapshotHash = '';
   private readonly CART_SNAPSHOT_THROTTLE_MS = 3000;
 
   // Amazon login hard-lock state. `taskStage` / `amazonLoginConfirmed` are cached from
@@ -133,74 +132,133 @@ export class Content {
 
   constructor() {
     this.notificationService = new NotificationService();
-    this.fetchArm();
-
-    if (this.isTopFrame) {
-      this.addContentLoadedListener();
-      this.initLoginGate();
-    }
+    // Capture the assigned classic arm at document_start; storage changes below
+    // reconcile it with the validated worker context.
+    const handoff = parseAssignment(location.href);
+    if (handoff?.arm === 'classic') this.assistantControl.setEnabled(true);
+    this.initStudyState();
+    if (this.isTopFrame) this.addContentLoadedListener();
   }
 
   public initialize(): void {
-    if (!this.isTopFrame) {
-      // Nothing here applies to a sub-frame - telemetry, cart tracking, and the login gate are
-      // all meaningful only for the top document. fetchArm() above already covers the one thing
-      // that does matter per-frame: hiding a classic-arm assistant panel if one renders here.
-      return;
-    }
-
-    this.addScrollListener();
+    if (!this.isTopFrame) return;
     this.addClickListener();
     this.addFilterListener();
     this.addSortListener();
     this.addResultClickListener();
     this.addCartRemoveListener();
-    this.addCartObservers();
     this.addBfcacheRestoreListener();
+    chrome.runtime.onMessage.addListener((message:any, _sender:any, reply:any) => {
+      if (message?.type !== 'study_read_cart') return;
+      reply(this.readCart());
+    });
+    if (document.readyState !== 'loading') this.onReady();
+    else document.addEventListener('DOMContentLoaded', () => this.onReady(), {once:true});
+    if (isShoppingUrl(location.href)) {
+      chrome.runtime.sendMessage({type:'study_context'}, () => { void chrome.runtime.lastError; });
+    }
   }
 
-  private fetchArm(): void {
-    try {
-      chrome.runtime.sendMessage({ type: 'get_arm' }, (response: { arm?: Arm } | undefined) => {
-        const lastError = chrome.runtime.lastError;
-        if (lastError) {
-          console.warn('get_arm error', lastError.message);
-          return;
-        }
-
-        if (!response || !response.arm) {
-          return;
-        }
-
-        this.arm = response.arm;
-
-        if (!this.isTopFrame) {
-          // Sub-frame: only the classic-arm hide/observe path applies here (see isTopFrame's
-          // declaration) - chat-arm text capture and the availability check are per-page
-          // signals that must not be duplicated once per iframe.
-          if (this.arm === 'classic') {
-            this.hideAssistantIfNeeded();
-            this.setupAssistantObserver();
+  private initStudyState(): void {
+    const refresh = () => chrome.storage.local.get(
+      ['taskStage','amazonLoginConfirmed','studyContext','studyError'], (s:any) => {
+        this.taskStage = s.taskStage || 'initial';
+        this.amazonLoginConfirmed = s.amazonLoginConfirmed === true;
+        this.hasStudyContext = !!s.studyContext;
+        this.contextOrigin = s.studyContext?.origin || null;
+        this.contextExpiresAt = Number(s.studyContext?.expiresAt) || 0;
+        this.arm = s.studyContext?.arm || null;
+        const assignedPage = this.contextOrigin === location.origin;
+        const pendingClassic = !s.studyContext && parseAssignment(location.href)?.arm === 'classic';
+        this.assistantControl.setEnabled(pendingClassic || (assignedPage &&
+          (this.taskStage === 'shopping' || this.taskStage === 'registering') && this.arm === 'classic'));
+        if (this.isTopFrame) {
+          this.reassertLoginGate();
+          this.updateStudyBanner(s.studyError || '');
+          if (this.trackingActive()) {
+            this.capturePageOnce();
+            this.captureCartBaselineIfNeeded();
+            this.captureAssistantText();
+            this.checkAssistantAvailability();
           }
-          return;
         }
-
-        this.hideAssistantIfNeeded();
-        this.setupAssistantObserver();
-        this.setupAssistantCaptureObserver();
+      });
+    refresh();
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', refresh, {once:true});
+    chrome.storage.onChanged.addListener((changes:any, area:string) => {
+      if (area === 'local' && ['taskStage','amazonLoginConfirmed','studyContext','studyError'].some(k => k in changes)) refresh();
+    });
+    if (this.isTopFrame) {
+      this.loginGuardTimer = setInterval(() => {
+        if (this.taskStage === 'shopping' && this.contextExpiresAt <= Date.now()) {
+          chrome.runtime.sendMessage({type:'study_expired'}, () => { void chrome.runtime.lastError; });
+        }
+        this.reassertLoginGate();
+        if (this.trackingActive()) {
+          this.captureCartBaselineIfNeeded();
+          this.captureCartSnapshot();
+          this.captureAssistantText();
+          this.checkAssistantAvailability();
+        }
+      }, this.LOGIN_GUARD_INTERVAL_MS);
+    }
+  }
+  private trackingActive(): boolean {
+    return this.taskStage === 'shopping' && this.amazonLoginConfirmed && this.contextExpiresAt > Date.now() &&
+      this.contextOrigin === location.origin && !!this.arm && isShoppingUrl(location.href);
+  }
+  private onReady(): void {
+    this.updateStudyBanner('');
+    if (!this.assistantObserver) {
+      this.assistantObserver = new MutationObserver(() => {
+        if (!this.trackingActive()) return;
         this.captureAssistantText();
         this.checkAssistantAvailability();
       });
-    } catch (err) {
-      console.error('failed to request arm from background', err);
+      this.assistantObserver.observe(document.documentElement, {childList:true,subtree:true,characterData:true});
     }
+    this.capturePageOnce();
+  }
+  private updateStudyBanner(error: string): void {
+    if (!document.body || !isShoppingUrl(location.href)) return;
+    const show = this.hasStudyContext || !!parseAssignment(location.href) || !!error;
+    if (!show || ['final','stopped','done'].includes(this.taskStage || '')) {
+      this.banner?.remove(); this.banner = null; return;
+    }
+    if (!this.banner?.isConnected) {
+      const box = document.createElement('aside');
+      box.id = 'webmunk-study-banner';
+      box.setAttribute('aria-label','Webmunk shopping study');
+      // Normal document flow: never cover an assistant composer or Amazon control.
+      box.style.cssText = 'position:relative;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:.75rem;padding:.5rem 1rem;background:#fff;color:#222;border-bottom:2px solid #a41b33;';
+      const label = document.createElement('p');
+      label.style.cssText = 'margin:0;font:14px/1.4 system-ui,sans-serif;';
+      label.textContent = 'Shopping study: instructions and final product confirmation';
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = 'Open study panel';
+      button.style.cssText = 'font:inherit;padding:.6em 1em;cursor:pointer;';
+      button.addEventListener('click', () => {
+        chrome.runtime.sendMessage({type:'study_open_panel'}, (result:any) => {
+          if (chrome.runtime.lastError || !result?.ok) label.textContent = 'Click the Webmunk icon in Chrome’s toolbar to open the study panel.';
+          else label.textContent = 'You can close the study panel while shopping and reopen it here or from the Webmunk toolbar icon.';
+        });
+      });
+      box.append(label,button); document.body.prepend(box); this.banner = box;
+    }
+  }
+  private capturePageOnce(): void {
+    if (this.pageCaptured || document.readyState === 'loading' || !this.trackingActive()) return;
+    this.pageCaptured = true;
+    this.captureNavigationType(location.href);
+    if (this.isProductDetailPage(location.href)) this.sendTelemetry(Event.PRODUCT_PAGE_VIEW, {asin:this.getAsinFromUrl(location.href)});
+    this.captureCartSnapshot();
   }
 
   // `#nav-link-accountList` is the wrapping `<div class="nav-div">`, not the link itself -
   // the actual `<a href=...>` is a child of it. Reading `.getAttribute('href')` off the div
   // (as this used to) always returns null, which silently broke every href-based signal below.
   private getAccountLink(): HTMLAnchorElement | null {
-    return document.querySelector('#nav-link-accountList a') as HTMLAnchorElement | null;
+    return document.querySelector('a#nav-link-accountList, #nav-link-accountList a') as HTMLAnchorElement | null;
   }
 
   // Three states, not two. The old code returned `false` (= "locked, sign in") whenever the
@@ -230,6 +288,7 @@ export class Content {
   }
 
   private checkAmazonLoginStatus(): void {
+    if (this.taskStage !== 'shopping' || this.contextOrigin !== location.origin || !isShoppingUrl(location.href)) return;
     const state = this.getAmazonLoginState();
     debug('[wm] checkAmazonLoginStatus', {
       state,
@@ -257,7 +316,8 @@ export class Content {
     const navHref = this.getAccountLink()?.getAttribute('href') || '';
     if (navHref.includes('/ap/signin') || navHref.includes('/gp/sign-in')) {
       try {
-        return new URL(navHref, window.location.href).href;
+        const candidate = new URL(navHref, window.location.href);
+        if (candidate.origin === location.origin && candidate.protocol === 'https:') return candidate.href;
       } catch {
         /* fall through */
       }
@@ -290,33 +350,7 @@ export class Content {
     );
   }
 
-  // Caches taskStage / amazonLoginConfirmed and starts the periodic re-check that keeps the
-  // hard lock in sync with login state. Runs from the constructor so the lock is armed as
-  // early as possible, before the participant can interact with the page.
-  private initLoginGate(): void {
-    chrome.storage.local.get(['taskStage', 'amazonLoginConfirmed'], (r: any) => {
-      this.taskStage = (r && r.taskStage) || null;
-      this.amazonLoginConfirmed = Boolean(r && r.amazonLoginConfirmed);
-      this.reassertLoginGate();
-    });
 
-    chrome.storage.onChanged.addListener((changes: any, area: string) => {
-      if (area !== 'local') return;
-      if ('taskStage' in changes) this.taskStage = changes.taskStage.newValue || null;
-      if ('amazonLoginConfirmed' in changes) {
-        this.amazonLoginConfirmed = Boolean(changes.amazonLoginConfirmed.newValue);
-      }
-      if ('taskStage' in changes || 'amazonLoginConfirmed' in changes) {
-        this.reassertLoginGate();
-      }
-    });
-
-    // Amazon navigations are mostly full page loads (caught by DOMContentLoaded / pageshow),
-    // but this interval also: unlocks the page the moment sign-in is detected without waiting
-    // for a reload, catches any soft (history API) navigation, and is a backstop if the
-    // self-healing observer in NotificationService ever misses a removal.
-    this.loginGuardTimer = setInterval(() => this.reassertLoginGate(), this.LOGIN_GUARD_INTERVAL_MS);
-  }
 
   private dismissLoginBlockIfActive(): void {
     if (!this.loginBlockActive) return;
@@ -330,7 +364,7 @@ export class Content {
   // handleCartReached()'s server-side gate stays as a backstop.
   private reassertLoginGate(): void {
     // Never block the auth pages themselves, and never block outside the shopping stage.
-    if (this.isAmazonAuthPage() || this.taskStage !== 'shopping') {
+    if (!isShoppingUrl(location.href) || this.contextOrigin !== location.origin || this.taskStage !== 'shopping') {
       this.dismissLoginBlockIfActive();
       return;
     }
@@ -339,7 +373,8 @@ export class Content {
     // Lock ONLY on a definitive signed-out signal. `unknown` (nav not rendered, non-standard
     // page, other marketplace) must not lock - the gate re-runs on the interval, and
     // handleCartReached()'s server-side gate is the backstop for the critical checkpoint.
-    const lock = state === 'out' && !this.amazonLoginConfirmed;
+    const lock = state === 'out';
+    if (state === 'out' && this.amazonLoginConfirmed) this.checkAmazonLoginStatus();
 
     if (lock) {
       this.notificationService.showLoginBlock(this.buildSignInUrl());
@@ -380,39 +415,9 @@ export class Content {
 
   private addContentLoadedListener(): void {
     document.addEventListener('DOMContentLoaded', () => {
-      const url = window.location.href;
-
-      this.sendTelemetry(Event.CONTENT_LOADED, { url });
-
       this.checkAmazonLoginStatus();
-      this.enforceLoginRequirement();
-      this.captureCartBaselineIfNeeded();
-      this.captureNavigationType(url);
-
-      if (this.isProductDetailPage(url)) {
-        const asin = this.getAsinFromUrl(url);
-        this.sendTelemetry(Event.PRODUCT_PAGE_VIEW, { url, asin });
-      }
-
-      this.hideAssistantIfNeeded();
-      this.checkAssistantLeak();
-      this.captureAssistantText();
-      this.checkAssistantAvailability();
-    });
-  }
-
-  private addScrollListener(): void {
-    window.addEventListener('scroll', () => {
-      const now = Date.now();
-
-      if (now - this.lastScrollSent > this.SCROLL_THROTTLE_MS) {
-        this.lastScrollSent = now;
-
-        chrome.runtime.sendMessage({
-          action: 'page_action',
-          url: window.location.href,
-        });
-      }
+      this.reassertLoginGate();
+      this.capturePageOnce();
     });
   }
 
@@ -561,19 +566,11 @@ export class Content {
   }
 
   private addSortListener(): void {
-    const sortSelect = document.querySelector('select#s-result-sort-select') as HTMLSelectElement | null;
-    if (!sortSelect) return;
-
-    sortSelect.addEventListener('change', () => {
-      const selectedText = sortSelect.options[sortSelect.selectedIndex]?.text?.trim() || '';
-      const selectedValue = sortSelect.value || '';
-
-      this.sendTelemetry(Event.FILTER_USED, {
-        url: window.location.href,
-        filter_type: 'sort',
-        filter_text: selectedText || selectedValue,
-        filter_value: selectedValue || undefined,
-      });
+    document.addEventListener('change', (event) => {
+      const select = event.target as HTMLSelectElement;
+      if (!select.matches?.('select#s-result-sort-select')) return;
+      this.sendTelemetry(Event.FILTER_USED, {filter_type:'sort',
+        filter_text:select.options[select.selectedIndex]?.text?.trim(), filter_value:select.value});
     });
   }
 
@@ -634,7 +631,7 @@ export class Content {
       // fallback) - without this check, a decision made in that window would send an event
       // EventService silently drops (no registered user yet) while still burning this one-shot
       // flag, permanently losing the participant's real decision data once they do register.
-      const taskStarted = Boolean(result.taskStage) && result.taskStage !== 'initial';
+      const taskStarted = result.taskStage === 'shopping' && this.trackingActive();
       if (!taskStarted || !result.amazonLoginConfirmed) {
         // Evidence this exact guard fired - proof the earlier data-loss bug (this flag getting
         // silently burned on an event EventService would have dropped anyway) can't recur,
@@ -656,6 +653,7 @@ export class Content {
         url,
         asin,
         decision_latency_ms: latencyMs,
+        decision_definition: 'first_add_to_cart_click_not_final_choice',
         ...productInfo,
       });
 
@@ -695,7 +693,7 @@ export class Content {
 
   private extractCartSubtotal(): string | null {
     const el =
-      (document.querySelector('#sc-subtotal-label-activecart') as HTMLElement | null) ||
+      (document.querySelector('#sc-subtotal-amount-activecart') as HTMLElement | null) ||
       (document.querySelector('.sc-subtotal-activecart') as HTMLElement | null) ||
       (document.querySelector("[data-name='Subtotals'] .a-size-medium") as HTMLElement | null);
     const txt = el?.innerText?.trim() || '';
@@ -707,9 +705,10 @@ export class Content {
     if (!text) {
       return { text: null, amount: null };
     }
-    const numMatch = this.normalizePrice(text).replace(/[^0-9.]/g, '');
-    const parsed = parseFloat(numMatch);
-    return { text, amount: isNaN(parsed) ? null : parsed };
+    // Do not parse the count in "Subtotal (2 items)" as a monetary amount.
+    // Keep non-US formats as display text instead of guessing a decimal locale.
+    const match = text.match(/^\s*\$\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?)\s*$/);
+    return { text, amount: match ? Number(match[1].replace(/,/g, '')) : null };
   }
 
   // Reward-integrity baseline: how many items were already in the cart before this
@@ -748,7 +747,7 @@ export class Content {
       // otherwise a premature amazonLoginConfirmed flip before registration completes would
       // burn this one-shot flag on an event EventService silently drops, permanently losing the
       // real baseline once the participant does register.
-      const taskStarted = Boolean(result.taskStage) && result.taskStage !== 'initial';
+      const taskStarted = result.taskStage === 'shopping' && this.trackingActive();
       if (!taskStarted || !result.amazonLoginConfirmed) {
         // This branch re-runs on every page load until the gate clears - log the evidence once
         // per suppressed episode (not once per page load) so it stays meaningful rather than
@@ -779,295 +778,50 @@ export class Content {
     });
   }
 
-  // Full item-level cart snapshot - the "cart as presented" state, for comparing against
-  // the reward at claim time alongside the add_to_cart_click/cart_remove event trail and
-  // the pre-existing baseline count above.
+  // A live, item-level snapshot is required for confirmation. No fallback from
+  // a count alone: an unreadable cart must not silently pick the wrong product.
+  private readCart(): any {
+    if (!this.trackingActive() || !isCartUrl(location.href)) return {ok:false,items:[]};
+    const root = document.querySelector('#sc-active-cart');
+    if (!root) return {ok:false,items:[]};
+    const rows = Array.from(root.querySelectorAll<HTMLElement>('.sc-list-item[data-asin], [data-itemtype="active"][data-asin]'));
+    const items = rows.filter(row => isVisible(row) && row.getAttribute('data-removed') !== 'true')
+      .filter(row => !Array.from(row.querySelectorAll('.sc-list-item-removed-msg')).some(el => isVisible(el)))
+      .map(row => this.extractProductInfoFromCartItem(row))
+      .filter(item => item.asin && /^[A-Z0-9]{10}$/i.test(item.asin) && item.title);
+    const {text:subtotal,amount:subtotal_amount} = this.extractCartSubtotalDetails();
+    return {ok:true,loggedIn:this.getAmazonLoginState() === 'in',items,item_count:items.length,subtotal,subtotal_amount};
+  }
   private captureCartSnapshot(): void {
-    const now = Date.now();
-    if (now - this.lastCartSnapshotTs < this.CART_SNAPSHOT_THROTTLE_MS) return;
-
-    const activeCart = document.getElementById('sc-active-cart');
-    if (!activeCart) return;
-
-    // only start the throttle window once we actually have something to send - setting
-    // this before the activeCart check let one early/failed attempt (e.g. cart list not
-    // rendered yet on initial page load) silently block every real attempt for the next
-    // CART_SNAPSHOT_THROTTLE_MS, since nothing else re-invokes this on a timer.
-    this.lastCartSnapshotTs = now;
-
-    // Live DOM check 2026-07-06: every cart item's markup contains a hidden
-    // .sc-list-item-removed-msg template (style="display: none") from the start, toggled
-    // visible via JS only when that specific item is actually removed - it isn't something
-    // only present on removed items. Filtering it out unconditionally excluded every item,
-    // every time, which is why items[] came back empty while item_count (sourced separately
-    // from the subtotal text) was correct. An element still present as #sc-active-cart
-    // .sc-list-item at snapshot time is, by definition, currently active - no filter needed.
-    const items = Array.from(activeCart.querySelectorAll<HTMLElement>('.sc-list-item')).map((container) =>
-      this.extractProductInfoFromCartItem(container),
-    );
-
-    const { text: subtotal, amount: subtotal_amount } = this.extractCartSubtotalDetails();
-
-    // Live tests came back with a real subtotal ("Subtotal (2 items):") but zero .sc-list-item
-    // matches - Amazon's cart row markup doesn't match what this was written against. The
-    // subtotal text's own item count is a more reliable source for the count than enumerating
-    // rows, since it's the same text extractCartSubtotalDetails() already reads correctly
-    // elsewhere (cart_remove, final_subtotal). items[] stays best-effort for manual review.
-    const subtotalItemCountMatch = subtotal?.match(/\((\d+)\s*items?\)/i);
-    const subtotalItemCount = subtotalItemCountMatch ? parseInt(subtotalItemCountMatch[1], 10) : null;
-    const item_count = subtotalItemCount !== null ? subtotalItemCount : items.length;
-
-    this.sendTelemetry(Event.CART_SNAPSHOT, {
-      url: window.location.href,
-      items,
-      item_count,
-      subtotal,
-      subtotal_amount,
-    });
+    if (!this.trackingActive() || Date.now() - this.lastCartSnapshotTs < this.CART_SNAPSHOT_THROTTLE_MS) return;
+    const cart = this.readCart();
+    if (!cart.ok) return;
+    this.lastCartSnapshotTs = Date.now();
+    const hash = JSON.stringify(cart);
+    if (hash === this.lastCartSnapshotHash) return;
+    this.lastCartSnapshotHash = hash;
+    this.sendTelemetry(Event.CART_SNAPSHOT, cart);
   }
-
-  private addCartObservers(): void {
-    const isCart = window.location.pathname.includes('/cart');
-    if (!isCart) return;
-
-    // initial snapshot of whatever's in the cart the moment this page loads. Retried once
-    // after a short delay in case Amazon's cart list is still client-rendering - a session
-    // that only views /cart without removing anything has nothing else to re-trigger this.
-    this.captureCartSnapshot();
-    setTimeout(() => this.captureCartSnapshot(), 1500);
-
-    // observe removal messages after delete
-    const removalObserver = new MutationObserver(() => {
-      const activeCart = document.getElementById('sc-active-cart');
-      if (!activeCart) return;
-      const removedItems = activeCart.querySelectorAll<HTMLElement>('.sc-list-item-removed-msg');
-      removedItems.forEach((msg) => {
-        const title =
-          (msg.querySelector('.sc-product-link') as HTMLElement | null)?.innerText?.trim() ||
-          (msg.querySelector('a') as HTMLElement | null)?.innerText?.trim() ||
-          undefined;
-        setTimeout(() => {
-          const { text: subtotal, amount: subtotal_amount } = this.extractCartSubtotalDetails();
-          this.sendTelemetry(Event.CART_REMOVE, {
-            url: window.location.href,
-            title,
-            removed: true,
-            subtotal,
-            subtotal_amount,
-          });
-          this.captureCartSnapshot();
-        }, 300);
-      });
-    });
-    if (document.body) {
-      removalObserver.observe(document.body, { childList: true, subtree: true });
-    }
-
-    // observe subtotal changes
-    const subtotalEl =
-      (document.querySelector('#sc-subtotal-label-activecart') as HTMLElement | null) ||
-      (document.querySelector('.sc-subtotal-activecart') as HTMLElement | null);
-    if (subtotalEl) {
-      const observer = new MutationObserver(() => {
-        const now = Date.now();
-        this.captureCartSnapshot();
-        if (now - this.lastSubtotalTs < this.SUBTOTAL_THROTTLE_MS) return;
-        const { text: val, amount } = this.extractCartSubtotalDetails();
-        if (val && val !== this.lastSubtotalValue) {
-          this.lastSubtotalValue = val;
-          this.lastSubtotalTs = now;
-          this.sendTelemetry(Event.CART_SUBTOTAL, {
-            url: window.location.href,
-            subtotal: val,
-            subtotal_amount: amount,
-          });
-        }
-      });
-      observer.observe(subtotalEl, { childList: true, subtree: true, characterData: true });
-    }
-  }
-
   private hideAssistantIfNeeded(): void {
-    if (this.arm !== 'classic') {
-      return;
-    }
-
-    const url = window.location.href;
-    const selectors = [
-      '#nav-rufus-plus',
-      '#nav-alexa-plus',
-      '.rufus-sections-container',
-      '.alexa-sections-container',
-      '[data-csa-c-content-id*="rufus"][role="dialog"]',
-      '[data-csa-c-content-id*="alexa"][role="dialog"]',
-      '[aria-label*="Rufus"]',
-      '[aria-label*="Alexa"]',
-      // "Ask Alexa" inline related-questions widget on product pages - a separate Amazon
-      // feature (internal name "nile-inline") from the Rufus/Alexa panel above, found
-      // still visible in a classic-arm live test on 2026-07-04.
-      '#nile-inline_feature_div',
-      '[data-feature-name="nile-inline"]',
-    ];
-    const matches = Array.from(document.querySelectorAll<HTMLElement>(selectors.join(','))).filter(
-      (el) => el !== document.body && el !== document.documentElement,
-    );
-
-    if (!matches.length) {
-      return;
-    }
-
-    matches.forEach((el) => {
-      el.style.display = 'none';
-    });
-
-    const now = Date.now();
-    const hiddenCount = matches.length;
-    const shouldSend =
-      url !== this.lastAssistantHiddenUrl ||
-      hiddenCount !== this.lastAssistantHiddenCount ||
-      now - this.lastAssistantHiddenTs >= this.ASSISTANT_HIDDEN_THROTTLE_MS;
-
-    if (!shouldSend) {
-      return;
-    }
-
-    this.lastAssistantHiddenUrl = url;
-    this.lastAssistantHiddenCount = hiddenCount;
-    this.lastAssistantHiddenTs = now;
-
-    this.sendTelemetry(Event.ASSISTANT_HIDDEN, {
-      url,
-      reason: 'targeted selector .rufus-docked',
-      hidden_count: hiddenCount,
-    });
+    this.assistantControl.setEnabled(this.contextOrigin === location.origin &&
+      this.taskStage === 'shopping' && this.arm === 'classic');
   }
-
-  // Diagnostic for the classic arm: re-runs the same selector list right after hideAssistantIfNeeded
-  // hid every match, and reports anything that's still actually visible. A live participant report
-  // of the assistant being visible/usable in the classic arm, with no code change to explain it,
-  // means either (a) Amazon re-shows a previously-hidden element by toggling a class/style on the
-  // *same* node - invisible to a childList-only MutationObserver (see setupAssistantObserver below,
-  // now also watching attributes for exactly this), or (b) the entry point lives somewhere our
-  // selectors/frame reach doesn't cover (e.g. a fresh Amazon markup change, or an iframe - see
-  // all_frames in the manifest). This event exists to tell those apart next time it happens instead
-  // of guessing from a screenshot.
-  private checkAssistantLeak(): void {
-    if (this.arm !== 'classic') {
-      return;
-    }
-
-    const selectors = [
-      '#nav-rufus-plus',
-      '#nav-alexa-plus',
-      '.rufus-sections-container',
-      '.alexa-sections-container',
-      '[data-csa-c-content-id*="rufus"][role="dialog"]',
-      '[data-csa-c-content-id*="alexa"][role="dialog"]',
-      '[aria-label*="Rufus"]',
-      '[aria-label*="Alexa"]',
-      '#nile-inline_feature_div',
-      '[data-feature-name="nile-inline"]',
-    ];
-
-    const visible = Array.from(document.querySelectorAll<HTMLElement>(selectors.join(','))).filter(
-      (el) =>
-        el !== document.body &&
-        el !== document.documentElement &&
-        el.offsetParent !== null &&
-        getComputedStyle(el).display !== 'none' &&
-        getComputedStyle(el).visibility !== 'hidden',
-    );
-
-    if (!visible.length) {
-      return;
-    }
-
-    const now = Date.now();
-    if (now - this.lastAssistantLeakTs < this.ASSISTANT_LEAK_THROTTLE_MS) {
-      return;
-    }
-    this.lastAssistantLeakTs = now;
-
-    this.sendTelemetry(Event.ASSISTANT_LEAK_DETECTED, {
-      url: window.location.href,
-      count: visible.length,
-      // tag/id/class only - never text content, which could carry assistant conversation text.
-      tags: visible.slice(0, 5).map((el) => `${el.tagName.toLowerCase()}#${el.id}.${el.className}`.slice(0, 120)),
-      in_iframe: window !== window.top,
-    });
-  }
-
-  private setupAssistantObserver(): void {
-    if (this.arm !== 'classic') {
-      return;
-    }
-
-    const observer = new MutationObserver(() => {
-      this.hideAssistantIfNeeded();
-      this.checkAssistantLeak();
-    });
-
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      // Also watch attribute changes, not just node insertion/removal: if Amazon opens the
-      // assistant panel by toggling a class/style/aria-hidden attribute on an already-mounted
-      // node (rather than inserting new DOM), a childList-only observer never fires and the
-      // panel stays visible until the next unrelated mutation happens to trigger a re-check.
-      attributes: true,
-      attributeFilter: ['style', 'class', 'hidden', 'aria-hidden'],
-    });
-  }
-
-  private setupAssistantCaptureObserver(): void {
-    if (this.arm === 'classic') {
-      return;
-    }
-
-    const observer = new MutationObserver(() => {
-      this.captureAssistantText();
-      this.checkAssistantAvailability();
-    });
-
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-  }
-
-  // Manipulation check for the chat arms: was Amazon's assistant entry point actually on the
-  // page? Amazon gates Rufus/Alexa by region/account/experiment, so a chat_no_guide
-  // participant with zero assistant interactions is otherwise ambiguous ("didn't want to" vs
-  // "was never offered it"). Checks only the launcher / entry points (not the open panel, which
-  // only exists after the participant uses it). Fires once per page load; the worker folds it
-  // into session_summary.assistant_available.
   private checkAssistantAvailability(): void {
-    if (this.arm === 'classic' || this.assistantAvailableSent) {
-      return;
+    if (!this.trackingActive()) return;
+    const matches = Array.from(document.querySelectorAll<HTMLElement>(ASSISTANT_SELECTORS.join(','))).filter(isVisible);
+    if (this.arm === 'classic') {
+      if (matches.length && Date.now() - this.lastAssistantLeakTs > this.ASSISTANT_LEAK_THROTTLE_MS) {
+        this.lastAssistantLeakTs = Date.now();
+        this.sendTelemetry(Event.ASSISTANT_LEAK_DETECTED, {count:matches.length});
+      }
+    } else if (matches.length && !this.assistantAvailableSent) {
+      this.assistantAvailableSent = true;
+      this.sendTelemetry(Event.ASSISTANT_AVAILABLE);
     }
-
-    const entryPointSelectors = [
-      '#nav-rufus-plus',
-      '#nav-alexa-plus',
-      '[aria-label*="Rufus"]',
-      '[aria-label*="Alexa"]',
-      '#nile-inline_feature_div',
-      '[data-feature-name="nile-inline"]',
-    ];
-    const present = Array.from(document.querySelectorAll<HTMLElement>(entryPointSelectors.join(','))).some(
-      (el) => el !== document.body && el !== document.documentElement,
-    );
-    if (!present) {
-      return;
-    }
-
-    this.assistantAvailableSent = true;
-    this.sendTelemetry(Event.ASSISTANT_AVAILABLE, { url: window.location.href });
   }
 
   private captureAssistantText(): void {
-    if (this.arm === 'classic') {
+    if (!this.trackingActive() || (this.arm !== 'chat' && this.arm !== 'chat_no_guide')) {
       return;
     }
 
@@ -1083,7 +837,7 @@ export class Content {
     // bubble, not the assistant's markdown/product response, so scoping to it here misses all
     // product suggestions entirely.
     const matches = document.querySelectorAll<HTMLElement>(
-      '.rufus-papyrus-turn, .rufus-papyrus-active-turn, [id^="interaction"], .rufus-sections-container, .alexa-sections-container',
+      '.rufus-papyrus-turn, .rufus-papyrus-active-turn, .alexa-papyrus-turn, .alexa-papyrus-active-turn, .rufus-sections-container, .alexa-sections-container',
     );
     if (!matches.length) {
       return;
@@ -1101,16 +855,7 @@ export class Content {
       }>;
     }> = [];
 
-    // try to capture user input explicitly
-    const inputCandidates = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-      "input[aria-label*='Type'], textarea[aria-label*='Type'], input[aria-label*='Ask'], textarea[aria-label*='Ask'], input[type='text'], textarea",
-    );
-    inputCandidates.forEach((el) => {
-      const t = (el.value || '').trim();
-      if (t && t !== '[thinking]') {
-        userTexts.push(t);
-      }
-    });
+    // Capture submitted chat bubbles only, never arbitrary inputs or draft text.
 
     // explicit chat bubbles for user
     const userBubbles = document.querySelectorAll<HTMLElement>(
@@ -1368,6 +1113,7 @@ export class Content {
   }
 
   private sendTelemetry(event: Event, properties: Record<string, any> = {}): void {
+    if (!this.trackingActive()) return;
     try {
       chrome.runtime.sendMessage(
         {
@@ -1401,38 +1147,3 @@ export class Content {
     return /\/dp\/[A-Z0-9]{10}/i.test(url) || /\/gp\/product\/([A-Z0-9]{10})/i.test(url);
   }
 }
-
-//old extension
-// import { NotificationService } from './NotificationService';
-
-// export class Content {
-//   private lastScrollSent = 0;
-//   private readonly SCROLL_THROTTLE_MS = 1000;
-//   private readonly notificationService: NotificationService
-
-//   constructor () {
-//     this.notificationService = new NotificationService();
-//   }
-
-//   public initialize(): void {
-//     this.addScrollListener();
-//     this.addClickListener();
-//   }
-
-//   private addScrollListener(): void {
-//     window.addEventListener('scroll', () => {
-//       const now = Date.now();
-
-//       if (now - this.lastScrollSent > this.SCROLL_THROTTLE_MS) {
-//         this.lastScrollSent = now;
-//         chrome.runtime.sendMessage({ action: 'page_action', url: window.location.href });
-//       }
-//     });
-//   }
-
-//   private addClickListener(): void {
-//     window.addEventListener('click', () => {
-//         chrome.runtime.sendMessage({ action: 'page_action', url: window.location.href });
-//     }, true);
-//   }
-// }

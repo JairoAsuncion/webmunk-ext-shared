@@ -1,9 +1,9 @@
 {
     "manifest_version": 3,
 	"name": "Webmunk Shopping Study",
-	"version": "1.9",
+	"version": "2.0.0",
     "action": {
-        "default_popup": "popup/popup.html",
+        "default_title": "Open Webmunk study panel",
         "default_icon": "images/UvA.png"
       },
       "icons": {
@@ -15,12 +15,16 @@
 
 	"description": "Research extension for a University of Amsterdam study on how people search for and choose products while shopping on Amazon.",
 
-    "minimum_chrome_version": "102",
+    "side_panel": {
+        "default_path": "popup/popup.html"
+    },
+
+    "minimum_chrome_version": "116",
     "permissions": [
         "webNavigation",
         "storage",
         "tabs",
-        "notifications"
+        "sidePanel"
     ],
     "host_permissions": [
         "https://*.jitsu.com/*",
