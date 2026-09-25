@@ -1,7 +1,7 @@
 import { Backend } from './Backend';
 import { StudyService } from './StudyService';
 import { canTrack, cleanUrl, isShoppingUrl, isCartUrl, hasAssignment, validateQualtricsUrl, searchState, SORT_LABELS } from '../shared/StudyPolicy';
-import type { SearchState } from '../shared/StudyPolicy';
+import type { SearchState, StudyContext } from '../shared/StudyPolicy';
 
 // Firebase Remote Config's endpoint-override hook expects a window global.
 if (typeof (globalThis as any).window === 'undefined') (globalThis as any).window = globalThis;
@@ -317,8 +317,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-// Existing installation check only: no Qualtrics script injection or new host access.
+// Qualtrics checks the installation and, before assigning a new task, looks up
+// this browser's study session. Neither request changes the stored assignment.
 chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== 'webmunk_ping') return;
-  sendResponse({ok:true,id:chrome.runtime.id,version:chrome.runtime.getManifest().version});
+  const version = chrome.runtime.getManifest().version;
+  if (message?.type === 'webmunk_ping') {
+    sendResponse({ok:true,id:chrome.runtime.id,version});
+    return;
+  }
+  if (message?.type !== 'webmunk_lookup') return;
+  const pid = typeof message.prolificId === 'string' ? message.prolificId.trim().toLowerCase() : '';
+  if (!/^[a-f\d]{24}$/.test(pid)) {
+    sendResponse({ok:false,version,error:'Invalid participant ID.'});
+    return;
+  }
+  void chrome.storage.local.get(['studyContext','taskStage','user']).then(s => {
+    const c = s.studyContext as StudyContext | undefined;
+    if ((s.user && !c) || (c && c.prolificId !== pid) ||
+        (s.user?.prolificId && s.user.prolificId !== pid)) {
+      return {ok:true,version,status:'conflict'};
+    }
+    if (!c) return {ok:true,version,status:s.taskStage && s.taskStage !== 'initial' ? 'closed' : 'new'};
+    if (s.taskStage !== 'shopping' || !s.user || s.user.active === false ||
+        !(c.expiresAt > Date.now()) || !isShoppingUrl(c.origin)) {
+      return {ok:true,version,status:'closed'};
+    }
+    const url = new URL(c.origin);
+    url.searchParams.set('PROLIFIC_PID',c.prolificId);
+    url.searchParams.set('arm',c.arm);
+    url.searchParams.set('category',c.category);
+    return {ok:true,version,status:'resume',url:url.href};
+  }).then(sendResponse, e => sendResponse({ok:false,version,error:String(e)}));
+  return true;
 });

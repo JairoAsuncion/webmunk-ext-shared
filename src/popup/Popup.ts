@@ -52,10 +52,11 @@ async function render() {
   show('studyNotice', stage === 'shopping' && !!state.studyNotice);
   if (state.dataUploadError) el('upload').textContent = state.dataUploadError;
   show('upload',!!state.dataUploadError);
+  show('guided', stage === 'shopping' && c?.arm === 'chat');
+  show('assistantHelp', stage === 'shopping' && (c?.arm === 'chat' || c?.arm === 'chat_no_guide'));
   if (c) {
     el('assignment').textContent = 'Your task: ' + c.category + ' · Budget: $' + c.budget;
     el('pid').textContent = 'Participant ID: ' + c.prolificId;
-    show('guided', c.arm === 'chat');
   }
   show('login', stage === 'shopping' && !state.amazonLoginConfirmed);
   const cart = state.currentCart;
