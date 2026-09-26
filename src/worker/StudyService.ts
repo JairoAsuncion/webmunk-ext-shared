@@ -72,7 +72,7 @@ export class StudyService {
         surveyOpenedAt: null, surveyTabId: null, panelCloseStatus: null,
         decisionTracked: false, decisionMadeAt: null, cartBaselineCaptured: false,
         cartBaselineSuppressionLogged: false, currentCart: null, surveys: [], studySummary: {},
-        addedAsins: [], summarySent: false, studyError: '', registrationCompletedAt: Date.now() });
+        addedAsins: [], assistantQueries: [], assistantSubmits: [], assistantTurnKeys: [], summarySent: false, studyError: '', registrationCompletedAt: Date.now() });
       await this.backend.track('registration_completed', { source: 'amazon_handoff' });
     } catch (e) {
       await chrome.storage.local.set({ taskStage: 'initial', amazonLoginConfirmed: false,

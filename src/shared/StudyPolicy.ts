@@ -32,6 +32,85 @@ export function productAsin(raw: unknown): string | null {
   const m = String(raw ?? '').split(/[?#]/)[0].match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})(?:\/|$)/i);
   return m ? m[1].toUpperCase() : null;
 }
+// Assistant product cards link nowhere; their ASIN appears only in the card button's action ID,
+// e.g. "asin_cards_B0FDDBGSR5_open_url_3_1". "asin_cards_oam_sd_..." are offers from other
+// shops ("Available from the Web", "Shop direct"), which cannot be added to the Amazon cart.
+// "asin_cards_tbl_..." are rows of a comparison table; Amazon has been seen giving every row of
+// a table the first row's ID (capture C3), so callers accept those only via tableCardAsins().
+export function assistantCardAsin(actionId: unknown): { asin: string; external: boolean; table: boolean } | null {
+  const m = /^asin_cards_(?:(oam_[a-z]+_)|(tbl_))?([A-Z0-9]{10})_/i.exec(String(actionId ?? ''));
+  return m ? { asin: m[3].toUpperCase(), external: !!m[1], table: !!m[2] } : null;
+}
+// Table row ASINs in row order (null for rows without a button, i.e. without a price), or null
+// for the whole table when two rows carry the same ID.
+export function tableCardAsins(rowActionIds: unknown[]): Array<string | null> | null {
+  const asins = rowActionIds.map((id) => assistantCardAsin(id)?.asin ?? null);
+  const present = asins.filter(Boolean);
+  if (!present.length || new Set(present).size !== present.length) return null;
+  return asins;
+}
+// An assistant control's action attribute is Amazon's full action JSON (~500 bytes). Keep only
+// its type, and whether the control asks one of the assistant's ready-made questions (these
+// pills are nested twice: a DISMISS wrapper and the INVOKE action, both "related_questions").
+export function assistantAction(raw: unknown): { type: string | null; suggestedQuestion: boolean; query: string | null } {
+  const s = String(raw ?? '');
+  let type: string | null = null, query: string | null = null;
+  try {
+    const parsed = JSON.parse(s);
+    type = typeof parsed?.action?.actionType === 'string' ? parsed.action.actionType : null;
+    const q = parsed?.query ?? parsed?.action?.payload?.query;
+    query = typeof q === 'string' && q.trim() ? q.trim() : null;
+  } catch {
+    type = s && s.length <= 64 ? s : null;
+  }
+  return { type, suggestedQuestion: /RelatedQuestionsPayload|related_questions/.test(s), query };
+}
+// The assistant panel re-renders earlier conversations (from other pages, or from before the
+// study) without the participant asking anything. A question text counts as asked only when a
+// submit action (Enter in the panel, its send button, a ready-made question) preceded it.
+// Submits carry the submitted text and are matched to question texts by it: the old
+// conversation can finish rendering after the submit (T7 re-run), so order alone misleads.
+// Only a submit whose text could not be read pairs by order, with the newest remaining text.
+export type AssistantSubmit = { at: number; via: 'typed' | 'suggested'; text?: string };
+export const ASSISTANT_SUBMIT_WINDOW_MS = 60000;
+const sameQuestion = (a: string, b: string) =>
+  a.replace(/\s+/g, ' ').trim().toLowerCase() === b.replace(/\s+/g, ' ').trim().toLowerCase();
+export function classifyAssistantQueries(fresh: string[], submits: AssistantSubmit[], now: number):
+  { queries: Array<{ text: string; via: 'typed' | 'suggested' | 'history' }>; remaining: AssistantSubmit[] } {
+  const live = submits.filter((s) => now - s.at <= ASSISTANT_SUBMIT_WINDOW_MS).sort((a, b) => a.at - b.at);
+  const via: Array<'typed' | 'suggested' | 'history'> = fresh.map(() => 'history');
+  const used = new Set<AssistantSubmit>();
+  fresh.forEach((text, i) => {
+    const s = live.find((x) => !used.has(x) && x.text && sameQuestion(x.text, text));
+    if (s) { used.add(s); via[i] = s.via; }
+  });
+  const textless = live.filter((x) => !x.text);
+  for (let i = fresh.length - 1; i >= 0 && textless.length; i--) {
+    if (via[i] !== 'history') continue;
+    const s = textless.shift()!;
+    used.add(s); via[i] = s.via;
+  }
+  return { queries: fresh.map((text, i) => ({ text, via: via[i] })), remaining: live.filter((x) => !used.has(x)) };
+}
+// Every assistant snapshot repeats the whole conversation, re-rendered on each page. Turns are
+// identified by their content (Amazon renumbers turn IDs per page); only new or changed ones
+// need recording. FNV-1a, 32 bit: collisions are irrelevant at a few dozen turns per session.
+export function assistantTurnKey(turn: unknown): string {
+  const s = JSON.stringify((turn as any)?.blocks ?? turn ?? null);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, '0') + ':' + s.length;
+}
+export function newAssistantTurns(turns: unknown, known: string[]): { turns: any[]; keys: string[]; omitted: number } {
+  const list = Array.isArray(turns) ? turns : [];
+  const seen = new Set(known), keys: string[] = [], fresh: any[] = [];
+  for (const t of list) {
+    const key = assistantTurnKey(t);
+    if (seen.has(key)) continue;
+    seen.add(key); keys.push(key); fresh.push(t);
+  }
+  return { turns: fresh, keys, omitted: list.length - fresh.length };
+}
 // Search-results state that filter and sort actions change. Refinements are Amazon's
 // rh tokens (department filters appear there as n:...) plus custom price bounds, sorted
 // for comparison. The search box's department scope (i=, e.g. i=aps) belongs to the
@@ -77,6 +156,33 @@ export function canTrack(state: Record<string, any>, raw: string): boolean {
   return state.taskStage === 'shopping' && state.amazonLoginConfirmed === true &&
     !!c?.sessionId && Number(c.expiresAt) > Date.now() && !!parseArm(c.arm) && state.user?.prolificId === c.prolificId &&
     state.user?.active !== false && isShoppingUrl(raw) && new URL(raw).origin === c.origin;
+}
+export type SessionLookup =
+  | { status: 'new' | 'conflict' }
+  | { status: 'closed'; stage: string }
+  | { status: 'resume'; url: string }
+  | { status: 'invalid' };
+// Answers the intake survey before it assigns a task, mirroring StudyService.enroll: 'resume'
+// only when the Amazon link it returns would continue this browser's session, not re-assign it.
+export function lookupSession(state: Record<string, any>, rawPid: unknown, now = Date.now()): SessionLookup {
+  const pid = typeof rawPid === 'string' ? rawPid.trim().toLowerCase() : '';
+  if (!/^[a-f\d]{24}$/.test(pid)) return { status: 'invalid' };
+  const c = state.studyContext as StudyContext | undefined, user = state.user;
+  if ((user && !c) || (c && c.prolificId !== pid) || (user?.prolificId && user.prolificId !== pid)) {
+    return { status: 'conflict' };
+  }
+  const stage = String(state.taskStage || 'initial');
+  if (!c) return stage === 'initial' ? { status: 'new' } : { status: 'closed', stage };
+  // A failed registration keeps the assignment at 'initial' without a user; the same link retries it.
+  const open = stage === 'shopping' ? !!user : (stage === 'initial' || stage === 'registering') && !user;
+  if (!open || user?.active === false || !(Number(c.expiresAt) > now) || !isShoppingUrl(c.origin)) {
+    return { status: 'closed', stage };
+  }
+  const url = new URL(c.origin);
+  url.searchParams.set('PROLIFIC_PID', c.prolificId);
+  url.searchParams.set('arm', c.arm);
+  url.searchParams.set('category', c.category);
+  return { status: 'resume', url: url.href };
 }
 export function cleanUrl(raw: string): string {
   if (!isShoppingUrl(raw)) return '';

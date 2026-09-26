@@ -1,6 +1,6 @@
 import { Backend } from './Backend';
 import { StudyService } from './StudyService';
-import { canTrack, cleanUrl, isShoppingUrl, isCartUrl, hasAssignment, validateQualtricsUrl, searchState, SORT_LABELS } from '../shared/StudyPolicy';
+import { canTrack, cleanUrl, isShoppingUrl, isCartUrl, hasAssignment, validateQualtricsUrl, searchState, lookupSession, classifyAssistantQueries, newAssistantTurns, SORT_LABELS } from '../shared/StudyPolicy';
 import type { SearchState } from '../shared/StudyPolicy';
 
 // Firebase Remote Config's endpoint-override hook expects a window global.
@@ -23,7 +23,7 @@ const BEHAVIOR_EVENTS = new Set([
   'product_page_view', 'add_to_cart_click', 'cart_remove', 'cart_subtotal',
   'assistant_text', 'search_submitted', 'filter_used', 'backtrack_navigation',
   'decision_made', 'product_result_click', 'cart_baseline_count', 'cart_snapshot',
-  'assistant_hidden', 'assistant_available', 'assistant_leak_detected',
+  'assistant_hidden', 'assistant_available', 'assistant_leak_detected', 'assistant_query_submitted',
 ]);
 // Diagnostics about the sign-in gate itself: recorded during the shopping task even
 // before Amazon sign-in is confirmed (all other tracking conditions still apply).
@@ -39,6 +39,7 @@ async function record(event: string, props: Record<string, any>, tabId: number, 
     add_to_cart_click:'add_to_cart_count', cart_remove:'remove_count', search_submitted:'search_count',
     filter_used:'filter_count', backtrack_navigation:'backtrack_count', decision_made:'decision_count',
     product_result_click:'product_result_click_count', assistant_text:'assistant_interaction_count',
+    assistant_query_submitted:'assistant_query_count', assistant_history_query:'assistant_history_query_count',
     assistant_hidden:'assistant_hidden_count', assistant_leak_detected:'assistant_leak_count',
     amazon_login_block_shown:'login_block_shown_count', pre_task_activity_suppressed:'pre_task_suppressed_count' };
   if (counters[event] && props.document_lifecycle !== 'prerender') summary[counters[event]] = (summary[counters[event]] || 0) + 1;
@@ -191,6 +192,70 @@ chrome.webNavigation.onCommitted.addListener(details => {
   }).catch(console.error);
 });
 
+// Questions put to the assistant, one event per distinct text per session: the panel shows the
+// whole conversation again on every page. Panel texts are matched to the participant's submit
+// actions (classifyAssistantQueries); texts without one were re-rendered from an earlier
+// conversation (other pages, or before the study) and are recorded as assistant_history_query,
+// which does not count as use. Questions from the product page's inline "Ask Alexa" box arrive
+// already classified (surface inline_widget): they never appear in the panel.
+async function recordAssistantQueries(props: any, tabId: number, url: string) {
+  const s = await chrome.storage.local.get(null);
+  if (!canTrack(s, url)) return;
+  const seen: string[] = s.assistantQueries || [];
+  const clean = (t: unknown) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 500);
+  const items: Array<{ text: string; via: string; surface: string }> = [];
+  const add = (text: string, via: string, surface: string) => {
+    if (text && !seen.includes(text) && !items.some(q => q.text === text)) items.push({ text, via, surface });
+  };
+  for (const q of Array.isArray(props?.queries) ? props.queries : []) {
+    add(clean(q?.text), q?.via === 'suggested' ? 'suggested' : 'typed', q?.surface === 'inline_widget' ? 'inline_widget' : 'panel');
+  }
+  const texts: string[] = [...new Set<string>((Array.isArray(props?.texts) ? props.texts : []).map(clean))]
+    .filter(t => t && !seen.includes(t) && !items.some(q => q.text === t));
+  const { queries, remaining } = classifyAssistantQueries(texts, s.assistantSubmits || [], Date.now());
+  for (const q of queries) add(q.text, q.via, 'panel');
+  if (!items.length) return;
+  await chrome.storage.local.set({ assistantQueries: [...seen, ...items.map(q => q.text)], assistantSubmits: remaining });
+  for (const q of items) {
+    if (q.via === 'history') await record('assistant_history_query', { query: q.text, surface: q.surface }, tabId, url);
+    else await record('assistant_query_submitted', { query: q.text, via: q.via, surface: q.surface, in_first_capture: seen.length === 0 }, tabId, url);
+  }
+}
+
+// A snapshot keeps only conversation turns not recorded before in this session; one with
+// nothing new is dropped (the panel re-rendered on another page).
+async function newAssistantSnapshot(props: any, url: string): Promise<Record<string, any> | null> {
+  const s = await chrome.storage.local.get(null);
+  if (!canTrack(s, url)) return null;
+  const known: string[] = s.assistantTurnKeys || [];
+  const { turns, keys, omitted } = newAssistantTurns(props?.turns, known);
+  if (!turns.length) return null;
+  await chrome.storage.local.set({ assistantTurnKeys: [...known, ...keys] });
+  return { ...props, turns, turns_omitted: omitted };
+}
+
+// An add to cart outside the product page's button (search-result tile, assistant card, ...),
+// detected by the content script as a rise of the cart count badge. It is attributed to the
+// last "Add to cart" control clicked in the tab, and marks the first decision if none yet.
+const ADD_ATTRIBUTION_MS = 15000;
+async function recordCountedAdd(tabId: number, url: string, from: number, to: number) {
+  const now = Date.now();
+  const { addContexts = {}, explicitAdds = {} } = await chrome.storage.session.get(['addContexts', 'explicitAdds']);
+  const context = addContexts[tabId];
+  delete addContexts[tabId];
+  await chrome.storage.session.set({ addContexts });
+  if (explicitAdds[tabId] && now - explicitAdds[tabId] < ADD_ATTRIBUTION_MS) return;
+  const recent = context && now - context.at < ADD_ATTRIBUTION_MS ? context : null;
+  const props = { asin: recent?.asin ?? null, surface: recent?.surface ?? 'unknown', detection: 'cart_count',
+    cart_count_from: from, cart_count_to: to, ...(recent?.title ? { title: recent.title } : {}) };
+  await record('add_to_cart_click', props, tabId, url);
+  const s = await chrome.storage.local.get(null);
+  if (s.decisionTracked || !canTrack(s, url)) return;
+  await chrome.storage.local.set({ decisionTracked: true, decisionMadeAt: now });
+  await record('decision_made', { ...props, decision_definition: 'first_add_to_cart_click_not_final_choice',
+    decision_latency_ms: s.shoppingTaskStartedAt ? now - s.shoppingTaskStartedAt : null }, tabId, url);
+}
+
 chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
   if (details.frameId !== 0 || !isShoppingUrl(details.url)) return;
   void enqueue(() => recordSearchChange(details.tabId, details.url, (details as any).transitionQualifiers || []))
@@ -219,7 +284,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
   const content = tabId != null && isShoppingUrl(sender.url);
   const top = content && sender.frameId === 0;
-  const types = new Set(['study_context','amazon_login_status','telemetry','filter_hint','study_retry','study_cart',
+  const types = new Set(['study_context','amazon_login_status','telemetry','filter_hint','cart_add_context','assistant_submit',
+    'cart_count_increased','study_retry','study_cart',
     'study_refresh_cart','study_confirm','study_continue','study_stop','study_preview_reset','study_preview_p2','study_expired']);
   if (!types.has(message.type)) return;
   void enqueue(async () => {
@@ -258,7 +324,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === 'telemetry' && content && (BEHAVIOR_EVENTS.has(message.event) || PRE_LOGIN_EVENTS.has(message.event))) {
       if (!top && !['assistant_hidden','assistant_leak_detected'].includes(message.event)) return {ok:false};
+      if (message.event === 'assistant_query_submitted') {
+        await recordAssistantQueries(message.properties, tabId!, sender.url!);
+        return {ok:true};
+      }
+      if (message.event === 'assistant_text') {
+        const snapshot = await newAssistantSnapshot(message.properties, sender.url!);
+        if (snapshot) await record('assistant_text', snapshot, tabId!, sender.url!);
+        return {ok:true};
+      }
       await record(message.event, message.properties || {}, tabId!, sender.url!);
+      if (message.event === 'add_to_cart_click') {
+        // Recorded by the product page's button: the badge increase that follows is the same add.
+        const { explicitAdds = {} } = await chrome.storage.session.get('explicitAdds');
+        explicitAdds[tabId!] = Date.now();
+        await chrome.storage.session.set({ explicitAdds });
+      }
+      return {ok:true};
+    }
+    if (message.type === 'assistant_submit' && top) {
+      const s = await chrome.storage.local.get(null);
+      if (!canTrack(s, sender.url!)) return {ok:false};
+      const text = typeof message.text === 'string' ? message.text.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
+      const submits = [...(s.assistantSubmits || []), { at: Date.now(), via: message.via === 'suggested' ? 'suggested' : 'typed', ...(text ? { text } : {}) }];
+      await chrome.storage.local.set({ assistantSubmits: submits.slice(-5) });
+      return {ok:true};
+    }
+    if (message.type === 'cart_add_context' && tabId != null && isShoppingUrl(sender.tab?.url)) {
+      // Any frame of a study tab: the assistant's cards may render in a frame.
+      if (!canTrack(await chrome.storage.local.get(null), sender.tab?.url || '')) return {ok:false};
+      const { addContexts = {} } = await chrome.storage.session.get('addContexts');
+      const asin = typeof message.asin === 'string' && /^[A-Z0-9]{10}$/.test(message.asin) ? message.asin : null;
+      const title = typeof message.title === 'string' ? message.title.replace(/\s+/g, ' ').trim().slice(0, 300) : '';
+      addContexts[tabId!] = { asin, surface: String(message.surface || 'other').slice(0, 40), at: Date.now(), ...(title ? { title } : {}) };
+      await chrome.storage.session.set({ addContexts });
+      return {ok:true};
+    }
+    if (message.type === 'cart_count_increased' && top) {
+      await recordCountedAdd(tabId!, sender.url!, Number(message.from), Number(message.to));
       return {ok:true};
     }
     if (message.type === 'filter_hint' && top) {
@@ -317,8 +420,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-// Existing installation check only: no Qualtrics script injection or new host access.
+// Qualtrics checks the installation and, before assigning a new task, looks up this browser's
+// study session. Neither request changes stored state; no script injection or new host access.
 chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== 'webmunk_ping') return;
-  sendResponse({ok:true,id:chrome.runtime.id,version:chrome.runtime.getManifest().version});
+  const version = chrome.runtime.getManifest().version;
+  if (message?.type === 'webmunk_ping') {
+    sendResponse({ok:true,id:chrome.runtime.id,version});
+    return;
+  }
+  if (message?.type !== 'webmunk_lookup') return;
+  chrome.storage.local.get(['studyContext','taskStage','user']).then(s => {
+    const result = lookupSession(s, message.prolificId);
+    sendResponse(result.status === 'invalid' ? {ok:false,version,error:'Invalid participant ID.'} : {ok:true,version,...result});
+  }, e => sendResponse({ok:false,version,error:String(e)}));
+  return true;
 });

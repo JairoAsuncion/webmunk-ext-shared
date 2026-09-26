@@ -1,7 +1,7 @@
 import { NotificationService } from './NotificationService';
 import { Event } from '../enums';
 import { debug } from '../utils/log';
-import { isShoppingUrl, isCartUrl, parseAssignment, productAsin } from '../shared/StudyPolicy';
+import { isShoppingUrl, isCartUrl, parseAssignment, productAsin, assistantCardAsin, assistantAction, tableCardAsins } from '../shared/StudyPolicy';
 import { AssistantControl, ASSISTANT_SELECTORS, isVisible } from './AssistantControl';
 
 declare const chrome: any;
@@ -9,6 +9,16 @@ declare const chrome: any;
 // `chat_no_guide` and `chat` both leave the assistant available. Only the panel's
 // guidance differs. Unknown assignments never enable assistant capture.
 type Arm = 'chat' | 'classic' | 'chat_no_guide';
+
+// Each assistant turn (question + reply), the older renderer's section containers, and the
+// answer of the product page's inline "Ask Alexa" box (never shown in the panel).
+const ASSISTANT_TURN_SELECTOR =
+  '.rufus-papyrus-turn, .rufus-papyrus-active-turn, .alexa-papyrus-turn, .alexa-papyrus-active-turn, .rufus-sections-container, .alexa-sections-container, #dpx-rex-nile-inline-answer-text-container';
+const INLINE_ANSWER_ID = 'dpx-rex-nile-inline-answer-text-container';
+const MARKDOWN_SECTION = '[data-csa-c-content-id*="-markdownSection-"]';
+// A comparison table is drawn twice: the scrollable table and, over it, a pinned copy of its
+// first column (absolutely positioned). Buttons and star widgets are not answer text.
+const NOT_ANSWER_TEXT = '[style*="position: absolute"], button, [aria-label*="out of 5 stars"]';
 
 export class Content {
   private readonly notificationService: NotificationService;
@@ -30,8 +40,18 @@ export class Content {
   private studyNotice = '';
   private pageCaptured = false;
   private pageViewCaptured = false;
-  private lastAssistantCapture = 0;
-  private readonly RUFUS_CAPTURE_THROTTLE_MS = 1500;
+  private readonly sentAssistantQueries = new Set<string>();
+  // Assistant snapshots are taken once the panel has stopped changing (the answer has finished
+  // streaming), at the latest after ASSISTANT_MAX_WAIT_MS, and when the page is left or hidden.
+  // Snapshotting during streaming produced one partial copy of the whole conversation every
+  // 1.5 s (T4: 28 snapshots, 98% of the bytes redundant).
+  private readonly ASSISTANT_SETTLE_MS = 2500;
+  private readonly ASSISTANT_MAX_WAIT_MS = 15000;
+  private readonly ASSISTANT_CHECK_MS = 250;
+  private assistantSettleTimer: ReturnType<typeof setTimeout> | null = null;
+  private assistantPendingSince = 0;
+  private lastAssistantCheck = 0;
+  private lastAssistantSignature = '';
   private lastAssistantPayloadHash: string | null = null;
   // Fired at most once per page load (per content-script instance); the worker folds it into
   // session_summary.assistant_available.
@@ -143,8 +163,11 @@ export class Content {
   }
 
   public initialize(): void {
+    // All frames: the assistant's product cards may render inside a frame.
+    this.addCartContextListener();
     if (!this.isTopFrame) return;
     this.addClickListener();
+    this.addAssistantSubmitListener();
     this.addFilterListener();
     this.addResultClickListener();
     this.addCartRemoveListener();
@@ -180,7 +203,7 @@ export class Content {
           if (this.trackingActive()) {
             this.capturePageOnce();
             this.captureCartBaselineIfNeeded();
-            this.captureAssistantText();
+            this.scheduleAssistantCapture();
             this.checkAssistantAvailability();
           }
         }
@@ -198,8 +221,9 @@ export class Content {
         this.reassertLoginGate();
         if (this.trackingActive()) {
           this.captureCartBaselineIfNeeded();
+          this.checkCartCountIncrease();
           this.captureCartSnapshot();
-          this.captureAssistantText();
+          this.scheduleAssistantCapture();
           this.checkAssistantAvailability();
         }
       }, this.LOGIN_GUARD_INTERVAL_MS);
@@ -214,10 +238,15 @@ export class Content {
     if (!this.assistantObserver) {
       this.assistantObserver = new MutationObserver(() => {
         if (!this.trackingActive()) return;
-        this.captureAssistantText();
+        this.scheduleAssistantCapture();
         this.checkAssistantAvailability();
       });
       this.assistantObserver.observe(document.documentElement, {childList:true,subtree:true,characterData:true});
+      // Leaving or hiding the page before the answer settled must not lose the last state.
+      window.addEventListener('pagehide', () => this.flushAssistantCapture());
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') this.flushAssistantCapture();
+      });
     }
     this.capturePageOnce();
   }
@@ -455,6 +484,171 @@ export class Content {
         this.trackDecisionIfNeeded(url, asin, productInfo);
       }
     });
+  }
+
+  // Submit actions tell asked questions from re-rendered history (the worker pairs them with the
+  // question texts that appear next). The product page's inline "Ask Alexa" box answers in place
+  // and never shows the question in the panel, so its question is read at submit time: the
+  // submitted value, never draft text.
+  private addAssistantSubmitListener(): void {
+    const PANEL = '#rufus-container, #rufus-docked-container, #alexa-shopping-container, .rufus-docked';
+    const INLINE_INPUT = 'dpx-rex-nile-search-text-input';
+    // The submitted text (the text box value at Enter/send, a ready-made question's query) lets
+    // the worker match the question by text rather than by order.
+    const submit = (via: 'typed' | 'suggested', raw: string) => {
+      if (!this.assistantTracked()) return;
+      const text = raw.replace(/\s+/g, ' ').trim().slice(0, 500);
+      try {
+        chrome.runtime.sendMessage({ type: 'assistant_submit', via, ...(text ? { text } : {}) }, () => { void chrome.runtime.lastError; });
+      } catch {
+        // Extension reloaded while this tab's script is still the old instance.
+      }
+    };
+    const inline = (raw: string, via: 'typed' | 'suggested') => {
+      const text = raw.replace(/\s+/g, ' ').trim().slice(0, 500);
+      if (!text || !this.assistantTracked()) return;
+      this.sendTelemetry(Event.ASSISTANT_QUERY_SUBMITTED, { queries: [{ text, via, surface: 'inline_widget' }] });
+    };
+    document.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (target.id === INLINE_INPUT) { inline((target as HTMLInputElement).value || '', 'typed'); return; }
+      if (target.matches('textarea, input[type="text"]') && target.closest(PANEL)) submit('typed', (target as HTMLTextAreaElement).value || '');
+    }, true);
+    document.addEventListener('click', (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (target.closest('#dpx-rex-nile-submit-button')) {
+        inline((document.getElementById(INLINE_INPUT) as HTMLInputElement | null)?.value || '', 'typed');
+        return;
+      }
+      // The box's question buttons, and the follow-up buttons under its answer (T7 re-run).
+      const inlinePill = target.closest('.dpx-rex-nile-inline-pill-button, #dpx-rex-nice-widget-container .pill-button') as HTMLElement | null;
+      if (inlinePill) {
+        const control = inlinePill.querySelector('input, button') as HTMLInputElement | HTMLButtonElement | null;
+        inline(control?.value || inlinePill.textContent || '', 'suggested');
+        return;
+      }
+      const panel = target.closest(PANEL);
+      if (!panel) return;
+      if (target.closest('#rufus-submit-button, .rufus-submit-button, button[aria-label="Submit" i]')) {
+        submit('typed', (panel.querySelector('#rufus-text-area, textarea') as HTMLTextAreaElement | null)?.value || '');
+        return;
+      }
+      const control = target.closest('[data-rufus-action], [data-alexa-action]') as HTMLElement | null;
+      const action = control ? assistantAction(control.getAttribute('data-rufus-action') || control.getAttribute('data-alexa-action')) : null;
+      if (control && action?.suggestedQuestion) {
+        // The inner (INVOKE) action carries the query; the outer DISMISS wrapper does not.
+        const inner = control.querySelector('[data-rufus-action], [data-alexa-action]');
+        const query = action.query ||
+          (inner ? assistantAction(inner.getAttribute('data-rufus-action') || inner.getAttribute('data-alexa-action')).query : null);
+        submit('suggested', query || control.textContent || '');
+      }
+    }, true);
+  }
+
+  // Adds outside the product page's button (search-result tiles, assistant product cards,
+  // "Buy it with" etc.) are detected from the cart count badge (checkCartCountIncrease) and
+  // attributed by the worker to the product of the last "Add to cart" control clicked here.
+  private addCartContextListener(): void {
+    document.addEventListener('click', (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target || !this.trackingActive()) return;
+      const control = target.closest('button, input[type="submit"], input[type="button"], [role="button"], a') as HTMLElement | null;
+      if (!control) return;
+      const label = (control.getAttribute('aria-label') || (control as HTMLInputElement).value ||
+        control.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!/\badd to (cart|basket)\b/i.test(label)) return;
+      const surface = !this.isTopFrame ? 'frame'
+        : control.closest(ASSISTANT_SELECTORS.join(',')) ? 'assistant'
+        : control.closest('[data-component-type="s-search-result"]') ? 'search_results'
+        : productAsin(location.href) ? 'product_page' : 'other';
+      const asin = this.asinNear(control) || (surface === 'product_page' ? productAsin(location.href) : null);
+      try {
+        const title = surface === 'assistant' ? this.assistantProductTitle(control) : null;
+        chrome.runtime.sendMessage({ type: 'cart_add_context', asin, surface, ...(title ? { title } : {}) }, () => { void chrome.runtime.lastError; });
+      } catch {
+        // Extension reloaded while this tab's script is still the old instance.
+      }
+    }, true);
+  }
+
+  // Product rows of the comparison tables in one answer block (capture C3): the row's product
+  // image carries the title as aria-label; its Add to cart button, if it has a price, the
+  // action ID. Rows of the pinned first-column copy are skipped.
+  private assistantTableRows(block: Element): Array<{ row: HTMLElement; title: string; actionId: string | null }> {
+    const rows: Array<{ row: HTMLElement; title: string; actionId: string | null }> = [];
+    block.querySelectorAll<HTMLElement>('div[aria-label]').forEach((image) => {
+      if (!image.querySelector(':scope > img') || image.closest('[style*="position: absolute"]')) return;
+      const row = image.closest<HTMLElement>('div[style*="flex-direction: row"]');
+      if (!row || !block.contains(row) || rows.some((r) => r.row === row)) return;
+      const titleEl = row.querySelector<HTMLElement>('[role="presentation"] div[dir="auto"]');
+      const title = (titleEl?.textContent || image.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      const actionId = row.querySelector('[data-csa-c-nile-action-id^="asin_cards_"]')?.getAttribute('data-csa-c-nile-action-id') || null;
+      if (title) rows.push({ row, title, actionId });
+    });
+    return rows;
+  }
+
+  // Answer text of a block, each piece once (see NOT_ANSWER_TEXT).
+  private answerText(el: HTMLElement): string {
+    if (!el.querySelector(NOT_ANSWER_TEXT)) return (el.innerText || '').replace(/\s+/g, ' ').trim();
+    const copy = el.cloneNode(true) as HTMLElement;
+    copy.querySelectorAll(NOT_ANSWER_TEXT).forEach((n) => n.remove());
+    const parts: string[] = [];
+    const walker = document.createTreeWalker(copy, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) parts.push(walker.currentNode.nodeValue || '');
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  // Title of the assistant product (table row or card) an element belongs to.
+  private assistantProductTitle(el: HTMLElement): string | null {
+    const block = el.closest(MARKDOWN_SECTION);
+    const row = block ? this.assistantTableRows(block).find((r) => r.row.contains(el)) : undefined;
+    if (row) return row.title;
+    const card = el.closest('[data-csa-c-type="container"][data-csa-c-content-id*="-section-container-"]');
+    const title = card?.querySelector('[style*="line-clamp"]')?.textContent?.replace(/\s+/g, ' ').trim();
+    return title || null;
+  }
+
+  // ASIN of the product an element belongs to: an assistant card button's action ID (table rows
+  // only when the table's IDs are distinct), the nearest data-asin, or the only product linked
+  // from its closest enclosing card.
+  private asinNear(el: HTMLElement): string | null {
+    const card = assistantCardAsin(el.closest('[data-csa-c-nile-action-id]')?.getAttribute('data-csa-c-nile-action-id'));
+    if (card?.external) return null;
+    if (card && !card.table) return card.asin;
+    if (card) {
+      const block = el.closest(MARKDOWN_SECTION);
+      const rows = block ? this.assistantTableRows(block) : [];
+      const i = rows.findIndex((r) => r.row.contains(el));
+      return i >= 0 ? tableCardAsins(rows.map((r) => r.actionId))?.[i] ?? null : null;
+    }
+    const tagged = el.closest('[data-asin]:not([data-asin=""])')?.getAttribute('data-asin') || '';
+    if (/^[A-Z0-9]{10}$/i.test(tagged)) return tagged.toUpperCase();
+    for (let node: HTMLElement | null = el, depth = 0; node && depth < 8; node = node.parentElement, depth++) {
+      const asins = new Set(Array.from(node.querySelectorAll('a[href]'))
+        .map(a => productAsin(a.getAttribute('href'))).filter(Boolean));
+      if (asins.size === 1) return [...asins][0] as string;
+      if (asins.size > 1) break;
+    }
+    return null;
+  }
+
+  private lastCartCount: number | null = null;
+  private checkCartCountIncrease(): void {
+    const count = this.extractCartItemCountBadge();
+    if (count === null) return;
+    const previous = this.lastCartCount;
+    this.lastCartCount = count;
+    // Quantity changes on the cart page also move the badge; they are not new additions.
+    if (previous === null || count <= previous || isCartUrl(location.href)) return;
+    try {
+      chrome.runtime.sendMessage({ type: 'cart_count_increased', from: previous, to: count }, () => { void chrome.runtime.lastError; });
+    } catch {
+      // Extension reloaded while this tab's script is still the old instance.
+    }
   }
 
   private captureNavigationType(url: string): void {
@@ -826,53 +1020,86 @@ export class Content {
     }
   }
 
+  private assistantTracked(): boolean {
+    return this.trackingActive() && (this.arm === 'chat' || this.arm === 'chat_no_guide');
+  }
+
+  // Called on every page change. Amazon pages change all the time (carousels, ads), so only a
+  // change of the assistant's own content counts: questions are then reported at once (their
+  // timing matters), and the snapshot waits until that content has been quiet for
+  // ASSISTANT_SETTLE_MS. A skipped check is harmless: a pending snapshot reads the live page.
+  private scheduleAssistantCapture(): void {
+    if (!this.assistantTracked()) return;
+    const now = Date.now();
+    if (now - this.lastAssistantCheck < this.ASSISTANT_CHECK_MS) return;
+    this.lastAssistantCheck = now;
+    const turns = document.querySelectorAll<HTMLElement>(ASSISTANT_TURN_SELECTOR);
+    let length = 0;
+    turns.forEach((el) => { length += (el.textContent || '').length; });
+    const signature = `${turns.length}:${length}`;
+    if (signature === this.lastAssistantSignature) return;
+    this.lastAssistantSignature = signature;
+    this.reportNewAssistantQueries(this.readAssistantUserTexts());
+    if (!this.assistantPendingSince) this.assistantPendingSince = now;
+    if (this.assistantSettleTimer) clearTimeout(this.assistantSettleTimer);
+    const wait = Math.max(0, Math.min(this.ASSISTANT_SETTLE_MS, this.assistantPendingSince + this.ASSISTANT_MAX_WAIT_MS - now));
+    this.assistantSettleTimer = setTimeout(() => this.flushAssistantCapture(), wait);
+  }
+
+  private flushAssistantCapture(): void {
+    if (this.assistantSettleTimer) clearTimeout(this.assistantSettleTimer);
+    this.assistantSettleTimer = null;
+    if (!this.assistantPendingSince) return;
+    this.assistantPendingSince = 0;
+    this.captureAssistantText();
+  }
+
+  // Submitted chat bubbles only, never inputs or draft text.
+  private readAssistantUserTexts(): string[] {
+    const texts = Array.from(document.querySelectorAll<HTMLElement>(
+      '.rufus-customer-text-wrap, .alexa-customer-text-wrap, .rufus-speech-bubble, .alexa-speech-bubble',
+    )).map((b) => (b.innerText || '').trim()).filter((t) => t && t !== '[thinking]').map((t) => t.slice(0, 500));
+    return Array.from(new Set(texts));
+  }
+
+  // Each question put to the assistant, once. The panel re-renders the whole conversation
+  // on every page; the worker de-duplicates across pages within the session.
+  private reportNewAssistantQueries(texts: string[]): void {
+    const fresh = texts.filter((t) => !this.sentAssistantQueries.has(t));
+    if (!fresh.length) return;
+    fresh.forEach((t) => this.sentAssistantQueries.add(t));
+    this.sendTelemetry(Event.ASSISTANT_QUERY_SUBMITTED, { texts: fresh });
+  }
+
   private captureAssistantText(): void {
-    if (!this.trackingActive() || (this.arm !== 'chat' && this.arm !== 'chat_no_guide')) {
+    if (!this.assistantTracked()) {
       return;
     }
 
     const normalizeText = (val: string): string => val.replace(/\s+/g, ' ').trim();
 
-    const now = Date.now();
-    if (now - this.lastAssistantCapture < this.RUFUS_CAPTURE_THROTTLE_MS) {
-      return;
-    }
-
     // Each AI turn (customer question + assistant reply) is wrapped in one of these container
     // elements. The old `.rufus-sections-container` class only wraps the customer's own text
     // bubble, not the assistant's markdown/product response, so scoping to it here misses all
     // product suggestions entirely.
-    const matches = document.querySelectorAll<HTMLElement>(
-      '.rufus-papyrus-turn, .rufus-papyrus-active-turn, .alexa-papyrus-turn, .alexa-papyrus-active-turn, .rufus-sections-container, .alexa-sections-container',
-    );
+    const found = Array.from(document.querySelectorAll<HTMLElement>(ASSISTANT_TURN_SELECTOR));
+    // Sections containers sit inside the turns; reading both recorded every block twice.
+    const matches = found.filter((el) => !found.some((o) => o !== el && o.contains(el)));
     if (!matches.length) {
       return;
     }
 
-    const userTexts: string[] = [];
-    const productSuggestions: Array<{ title: string; price?: string; asin?: string; brand?: string }> = [];
+    const userTexts = this.readAssistantUserTexts();
+    const productSuggestions: Array<{ title: string; price?: string; asin?: string; brand?: string; external?: boolean }> = [];
     const turns: Array<{
       sequence_id?: string | null;
       blocks: Array<{
-        kind: 'markdown' | 'header' | 'product' | 'footnote' | 'cta';
+        kind: 'markdown' | 'header' | 'product' | 'footnote' | 'cta' | 'suggested_question';
         text?: string;
-        product?: { title: string; price?: string; asin?: string; brand?: string; rating?: string; review_count?: string; url?: string; badge?: string; footnote?: string };
+        product?: { title: string; price?: string; asin?: string; brand?: string; external?: boolean; rating?: string; review_count?: string; url?: string; badge?: string; footnote?: string };
         action?: { text?: string; url?: string | null; action_type?: string | null };
       }>;
     }> = [];
-
-    // Capture submitted chat bubbles only, never arbitrary inputs or draft text.
-
-    // explicit chat bubbles for user
-    const userBubbles = document.querySelectorAll<HTMLElement>(
-      '.rufus-customer-text-wrap, .alexa-customer-text-wrap, .rufus-speech-bubble, .alexa-speech-bubble',
-    );
-    userBubbles.forEach((b) => {
-      const t = (b.innerText || '').trim();
-      if (t && t !== '[thinking]') {
-        userTexts.push(t);
-      }
-    });
 
     matches.forEach((section) => {
       const sequenceId =
@@ -881,16 +1108,16 @@ export class Content {
         section.getAttribute('data-alexa-sequenceid') ||
         section.getAttribute('data-csa-c-sequence-id');
 
-      type CandidateKind = 'markdown' | 'header' | 'product' | 'footnote' | 'cta';
+      type CandidateKind = 'markdown' | 'header' | 'product' | 'footnote' | 'cta' | 'suggested_question';
       const candidates: Array<{ el: Element; kind: CandidateKind; payload: any }> = [];
 
       // markdown blocks
       section
         .querySelectorAll<HTMLElement>(
-          'p.rufus-markdown-paragraph, p.alexa-markdown-paragraph, [data-csa-c-content-id*="-markdownSection-"]',
+          `p.rufus-markdown-paragraph, p.alexa-markdown-paragraph, ${MARKDOWN_SECTION}, .rufus-dpx-markdown-content`,
         )
         .forEach((el) => {
-          const text = normalizeText(el.innerText || '');
+          const text = this.answerText(el);
           if (text) {
             candidates.push({ el, kind: 'markdown', payload: { text } });
           }
@@ -914,11 +1141,30 @@ export class Content {
       section
         .querySelectorAll<HTMLElement>('[data-section-class*="AsinFaceout"] [data-csa-c-asin], [data-section-class*="AsinFaceout"] [data-asin]')
         .forEach((el) => productEls.add(el));
-      // Current renderer: cards are role="button" divs identified by data-csa-c-content-id
-      // (e.g. "rufus-dsk-section-asinCard-<uuid>"); no semantic classes on the card itself.
-      section.querySelectorAll<HTMLElement>('[data-csa-c-content-id*="-asinCard-"]').forEach((el) => productEls.add(el));
+      // Current renderer (live capture 2026-09-26): each card is its own section container
+      // ("rufus-dsk-section-container-<uuid>") with a line-clamped title. The "-asinCard-" ID
+      // belongs to the card's Add to cart button, which holds no title; cards without a price
+      // have no button at all.
+      section
+        .querySelectorAll<HTMLElement>('[data-csa-c-type="container"][data-csa-c-content-id*="-section-container-"]')
+        .forEach((el) => {
+          if (el.querySelector('[style*="line-clamp"]')) productEls.add(el);
+        });
+      // Comparison tables inside answer text, and the inline "Ask Alexa" box's product links.
+      // Their title (and a table row's ASIN, when trustworthy) is known up front.
+      const known = new Map<HTMLElement, { title: string; asin?: string }>();
+      section.querySelectorAll<HTMLElement>(MARKDOWN_SECTION).forEach((block) => {
+        const rows = this.assistantTableRows(block);
+        const asins = tableCardAsins(rows.map((r) => r.actionId));
+        rows.forEach((r, i) => { productEls.add(r.row); known.set(r.row, { title: r.title, asin: asins?.[i] ?? undefined }); });
+      });
+      section.querySelectorAll<HTMLElement>('a.askBlueAsinFaceoutTitle').forEach((a) => {
+        productEls.add(a);
+        known.set(a, { title: normalizeText(a.textContent || '') });
+      });
 
       productEls.forEach((card) => {
+        const preset = known.get(card);
         const titleEl =
           (card.querySelector('h2.a-size-base.a-spacing-none.a-color-base.a-text-normal > span') as HTMLElement | null) ||
           (card.querySelector('[style*="line-clamp"]') as HTMLElement | null) ||
@@ -926,7 +1172,7 @@ export class Content {
         // The card image's alt text carries the full (untruncated) product title in the
         // current renderer, where the visible title div is line-clamped.
         const imgAlt = normalizeText((card.querySelector('img[alt]') as HTMLImageElement | null)?.alt || '');
-        const rawTitle = imgAlt || titleEl?.innerText || '';
+        const rawTitle = preset?.title || imgAlt || titleEl?.innerText || '';
         const title = normalizeText(rawTitle);
         if (!title || title.length < 2) return;
 
@@ -942,9 +1188,16 @@ export class Content {
         // truncation issue - a specific, total extraction gap). This only checked the '/dp/'
         // URL pattern; getAsinFromUrl() already handles '/gp/product/' too (confirmed that
         // pattern is what Amazon actually uses on the cart page), but was never reused here.
+        const cardAction = assistantCardAsin(
+          card.querySelector('[data-csa-c-nile-action-id^="asin_cards_"]')?.getAttribute('data-csa-c-nile-action-id') ||
+            card.getAttribute('data-action-id'),
+        );
+        const external = cardAction?.external || undefined;
         const asinMatch =
+          preset?.asin ||
           card.getAttribute('data-csa-c-asin') ||
           card.getAttribute('data-asin') ||
+          (cardAction && !cardAction.external && !cardAction.table ? cardAction.asin : null) ||
           this.getAsinFromUrl(href) ||
           undefined;
 
@@ -990,8 +1243,8 @@ export class Content {
           (titleEl?.closest('a')?.getAttribute('href') || card.querySelector('a[href]')?.getAttribute('href') || href || '') ||
           undefined;
 
-        const product = { title, price, asin: asinMatch, rating, review_count: reviewCount, url, badge, footnote };
-        productSuggestions.push({ title, price, asin: asinMatch });
+        const product = { title, price, asin: asinMatch, external, rating, review_count: reviewCount, url, badge, footnote };
+        productSuggestions.push({ title, price, asin: asinMatch, external });
         candidates.push({ el: card, kind: 'product', payload: { product } });
       });
 
@@ -1005,18 +1258,27 @@ export class Content {
         }
         });
 
-      // CTA / quick replies / links inside the turn
+      // CTA / quick replies / links inside the turn. Ready-made questions are kept as their text
+      // only, once each (what was offered; asking one shows up as a user text).
+      const seenControls = new Set<string>();
       section
         .querySelectorAll<HTMLElement>('[data-rufus-action], [data-alexa-action], .rufus-action, .alexa-action, [data-action-type]')
         .forEach((el) => {
         const text = normalizeText(el.innerText || '');
         if (!text) return;
+        const action = assistantAction(el.getAttribute('data-rufus-action') || el.getAttribute('data-alexa-action') || el.getAttribute('data-action-type'));
+        const key = (action.suggestedQuestion ? 'q|' : 'c|') + text;
+        if (seenControls.has(key)) return;
+        seenControls.add(key);
+        if (action.suggestedQuestion) {
+          candidates.push({ el, kind: 'suggested_question', payload: { text } });
+          return;
+        }
         const url = (el.getAttribute('href') || el.getAttribute('data-url') || el.getAttribute('data-rufus-url') || el.getAttribute('data-alexa-url') || '').trim();
-        const actionType = el.getAttribute('data-rufus-action') || el.getAttribute('data-alexa-action') || el.getAttribute('data-action-type') || null;
         candidates.push({
           el,
           kind: 'cta',
-          payload: { text, action: { text, url: url || null, action_type: actionType } },
+          payload: { text, action: { text, url: url || null, action_type: action.type } },
         });
         });
 
@@ -1030,13 +1292,14 @@ export class Content {
       });
 
       const blocks: Array<{
-        kind: 'markdown' | 'header' | 'product' | 'footnote' | 'cta';
+        kind: 'markdown' | 'header' | 'product' | 'footnote' | 'cta' | 'suggested_question';
         text?: string;
         product?: {
           title: string;
           price?: string;
           asin?: string;
           brand?: string;
+          external?: boolean;
           rating?: string;
           review_count?: string;
           url?: string;
@@ -1063,43 +1326,31 @@ export class Content {
       }
     });
 
-    const uniqueUserTexts = Array.from(new Set(userTexts.filter(Boolean)));
+    // Most recent recommendations; every product of every answer is also in turns.
     const uniqueProducts = productSuggestions
       .filter((p, idx, arr) => {
         const key = `${p.title}|${p.price || ''}|${p.asin || ''}`;
         return arr.findIndex((q) => `${q.title}|${q.price || ''}|${q.asin || ''}` === key) === idx;
       })
-      .slice(0, 10);
+      .slice(-10);
 
-    const meaningfulTurns = turns.filter((t) => t.blocks.length);
-
-    if (!uniqueUserTexts.length && !uniqueProducts.length && !meaningfulTurns.length) {
+    // Amazon renders the assistant's ready-made questions into pages the participant never
+    // opened the assistant on; without a question or a recommendation there is no use to record.
+    const inlineAnswer = turns.some((t) => t.sequence_id === INLINE_ANSWER_ID);
+    if (!userTexts.length && !uniqueProducts.length && !inlineAnswer) {
       return;
     }
 
     // Cap turns to last 10 for efficiency
-    const cappedTurns = meaningfulTurns.slice(-10);
+    const cappedTurns = turns.filter((t) => t.blocks.length).slice(-10);
 
-    // also provide a flattened view for the first few products
-    const flattened: Record<string, string | undefined> = {};
-    uniqueProducts.forEach((p, i) => {
-      const idx = i + 1;
-      flattened[`product_${idx}_title`] = p.title;
-      flattened[`product_${idx}_price`] = p.price;
-      flattened[`product_${idx}_asin`] = p.asin;
-      flattened[`product_${idx}_brand`] = p.brand;
-    });
-
-    // Truncate long text fields to 500 chars and cap product suggestions to 5
-    const truncatedUserTexts = uniqueUserTexts.map((t) => t.slice(0, 500));
-    const cappedProducts = uniqueProducts.slice(0, 5);
+    this.reportNewAssistantQueries(userTexts);
 
     const payload = {
       url: window.location.href,
-      user_texts: truncatedUserTexts,
-      product_suggestions: cappedProducts,
+      user_texts: userTexts,
+      product_suggestions: uniqueProducts,
       turns: cappedTurns,
-      ...flattened,
     };
 
     const payloadHash = JSON.stringify({
@@ -1113,7 +1364,6 @@ export class Content {
       return;
     }
 
-    this.lastAssistantCapture = now;
     this.lastAssistantPayloadHash = payloadHash;
     this.sendTelemetry(Event.ASSISTANT_TEXT, payload);
   }

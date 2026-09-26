@@ -30,6 +30,8 @@ export enum Event {
   CART_SUBTOTAL = "cart_subtotal",
   TAB_DWELL = "tab_dwell",
   ASSISTANT_TEXT = "assistant_text",
+  // One question or request put to the assistant (from the conversation's user bubbles).
+  ASSISTANT_QUERY_SUBMITTED = "assistant_query_submitted",
   SEARCH_SUBMITTED = "search_submitted",
   SESSION_SUMMARY = "session_summary",
   FILTER_USED = "filter_used",

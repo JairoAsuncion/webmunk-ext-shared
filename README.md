@@ -13,8 +13,10 @@ configuration and credentials are not included. Configuration values
 
 ## Study flow
 
-1. The participant completes an intake survey (Qualtrics). The survey assigns a
-   study condition and a product category with a budget, then links to Amazon.
+1. The participant completes an intake survey (Qualtrics). The survey asks the
+   extension whether this browser already has a study session (and if so sends
+   the participant back to it); otherwise it assigns a study condition and a
+   product category with a budget, then links to Amazon.
 2. The extension reads the assignment from that link, registers the
    participant, and waits until they are signed into Amazon. Behavioural
    recording starts only after sign-in is confirmed.
@@ -32,8 +34,8 @@ shopping task, and stops after one hour at most.
 | Arm | Assistant | Instructions |
 |---|---|---|
 | `classic` | Hidden by the extension | Shop with the site's normal features |
-| `chat_no_guide` | Available | No instruction to use it |
-| `chat` | Available | Explicitly encouraged to use it |
+| `chat_no_guide` | Available | Told where it is, no instruction to use it (from v2.2.0) |
+| `chat` | Available | Told where it is and explicitly encouraged to use it |
 
 ## Recorded events
 
@@ -55,12 +57,14 @@ timestamp. URLs are reduced to the path plus search-related parameters.
 | `product_result_click` | A product in the search results is clicked |
 | `product_page_view` | A product detail page is opened |
 | `backtrack_navigation` | Back/forward navigation |
-| `add_to_cart_click` | A product is added to the cart |
+| `add_to_cart_click` | A product is added to the cart (product page, search results or assistant) |
 | `decision_made` | The first add-to-cart of the task |
 | `cart_baseline_count` | Number of items already in the cart at task start |
 | `cart_snapshot` | Cart contents when the cart page is viewed |
 | `cart_remove` | An item is removed from the cart |
-| `assistant_text` | Content of the assistant conversation (assistant arms only) |
+| `assistant_query_submitted` | The participant asks the assistant a question (typed or ready-made; panel or the product page's "Ask Alexa" box) |
+| `assistant_history_query` | A question from an earlier conversation is shown again (not use) |
+| `assistant_text` | New part of the assistant conversation, including recommended products, once an answer has finished (assistant arms only) |
 | `assistant_leak_detected` | The assistant was visible despite being hidden (classic arm diagnostic) |
 | `final_choice_confirmed` | The participant confirms their final product |
 | `session_summary` | Aggregated counts and durations at the end of the task |
@@ -83,6 +87,10 @@ timestamp. URLs are reduced to the path plus search-related parameters.
 - [docs/v2.1.0-pilot-fixes.md](docs/v2.1.0-pilot-fixes.md): problems found in the
   September 2026 pilot, how each was fixed and verified, and how the recorded
   data changed.
+- [docs/v2.2.0-assistant-and-returning-participants.md](docs/v2.2.0-assistant-and-returning-participants.md):
+  returning participants and the intake-survey lookup (message format), adds
+  from any surface, and the assistant record; data changes and how to measure
+  assistant use.
 
 ## Contributing
 

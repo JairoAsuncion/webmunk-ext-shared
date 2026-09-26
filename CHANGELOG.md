@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.2.0: Returning participants, adds from any surface, assistant record (September 2026)
+
+Tested with the automated tests and live on Amazon in all three arms. Details,
+verification and data changes:
+[docs/v2.2.0-assistant-and-returning-participants.md](docs/v2.2.0-assistant-and-returning-participants.md).
+
+- The intake survey can ask the extension for an existing session
+  (`webmunk_lookup`) and send a returning participant back to their task
+  (contributed in pull request #1).
+- The study panel shows both assistant arms where Amazon's assistant is; only
+  `chat` is told to use it. This changes the `chat_no_guide` condition
+  compared with the pilot.
+- Adds to the cart from search results and from the assistant are recorded,
+  with the product and where it was added.
+- Each question to the assistant is recorded once (`assistant_query_submitted`,
+  typed or ready-made, panel or the product page's "Ask Alexa" box); earlier
+  conversations shown again are kept apart (`assistant_history_query`).
+- Products the assistant recommends are captured.
+- Assistant snapshots are taken once per finished answer and contain only new
+  conversation turns (about a third of the previous data volume).
+- Event schema version 5.
+
 ## v2.1.0: Fixes from the pilot (testing release, September 2026)
 
 Tested with the automated tests and live on Amazon; not yet submitted to the
